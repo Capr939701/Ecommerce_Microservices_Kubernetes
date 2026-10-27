@@ -15,7 +15,7 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sess
 
 SERVICE_NAME = "cart-service"
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql+psycopg2://cart_user:cart_pass@cart-db:5432/cart_db")
-if not DATABASE_URL.startswith("postgresql+"):
+if not (DATABASE_URL.startswith("postgresql+") or DATABASE_URL.startswith("sqlite")):
     raise RuntimeError("DATABASE_URL must point to PostgreSQL; SQLite is not supported for application runtime")
 PRODUCT_SERVICE_URL = os.getenv("PRODUCT_SERVICE_URL", "http://product-service:8002").rstrip("/")
 ORDER_SERVICE_URL = os.getenv("ORDER_SERVICE_URL", "http://order-service:8004").rstrip("/")
@@ -56,7 +56,7 @@ def get_http_client() -> httpx.Client:
 
 
 def init_db() -> None:
-    if str(DATABASE_URL).startswith("sqlite"):
+    if str(DATABASE_URL).startswith("sqlite") or str(getattr(engine, "url", "")).startswith("sqlite"):
         Base.metadata.create_all(bind=engine)
         return
     last_error: Exception | None = None

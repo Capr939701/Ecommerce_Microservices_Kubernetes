@@ -100,7 +100,7 @@ def get_http_client() -> httpx.Client:
 
 
 def init_db() -> None:
-    if str(DATABASE_URL).startswith("sqlite"):
+    if str(DATABASE_URL).startswith("sqlite") or str(getattr(engine, "url", "")).startswith("sqlite"):
         Base.metadata.create_all(bind=engine)
         return
     last_error: Exception | None = None

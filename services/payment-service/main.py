@@ -76,6 +76,9 @@ Index(
 
 def initialize_database() -> None:
     """Wait briefly for the configured database, then fail startup clearly."""
+    if str(DATABASE_URL).startswith("sqlite") or str(getattr(engine, "url", "")).startswith("sqlite"):
+        Base.metadata.create_all(bind=engine)
+        return
     last_error: Exception | None = None
     for attempt in range(1, DB_CONNECT_RETRIES + 1):
         try:

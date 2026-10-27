@@ -20,7 +20,7 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sess
 
 load_dotenv()
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql+psycopg2://auth_user:auth_pass@auth-db:5432/auth_db")
-if not DATABASE_URL.startswith("postgresql+"):
+if not (DATABASE_URL.startswith("postgresql+") or DATABASE_URL.startswith("sqlite")):
     raise RuntimeError("DATABASE_URL must point to PostgreSQL; SQLite is not supported for application runtime")
 JWT_SECRET = os.getenv("JWT_SECRET", "")
 JWT_ALGORITHM = "HS256"
@@ -91,7 +91,7 @@ def get_db() -> Generator[Session, None, None]:
 def init_db() -> None:
     if not JWT_SECRET or len(JWT_SECRET) < 32:
         raise RuntimeError("JWT_SECRET must be configured and contain at least 32 characters")
-    if str(DATABASE_URL).startswith("sqlite"):
+    if str(DATABASE_URL).startswith("sqlite") or str(getattr(engine, "url", "")).startswith("sqlite"):
         Base.metadata.create_all(bind=engine)
         return
     last_error: Exception | None = None

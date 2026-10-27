@@ -54,6 +54,7 @@ from sqlalchemy.pool import StaticPool
 from fastapi.testclient import TestClient
 _real_create_engine = sqlalchemy.create_engine
 sqlalchemy.create_engine = lambda *args, **kwargs: _real_create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+sys.modules.pop("main", None)
 try:
     import main
 finally:

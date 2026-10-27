@@ -1,3 +1,4 @@
+import sys
 from decimal import Decimal
 from fastapi.testclient import TestClient
 import sqlalchemy
@@ -8,6 +9,7 @@ import pytest
 
 _real_create_engine = sqlalchemy.create_engine
 sqlalchemy.create_engine = lambda *args, **kwargs: _real_create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+sys.modules.pop("main", None)
 try:
     import main
 finally:
@@ -124,13 +126,20 @@ def test_stock_conflict_cancels_order(setup_client):
         if url.endswith("/inventory/reservations"):
             return FakeResponse(409, {"detail": "Insufficient stock"})
         return FakeResponse(404, {})
-    import main as module
-    original = module.httpx.request
-    module.httpx.request = conflict_request
+    class ConflictClient:
+        def request(self, method, url, timeout=None, headers=None, **kwargs):
+            return conflict_request(method, url, timeout=timeout, headers=headers, **kwargs)
+        @property
+        def is_closed(self):
+            return False
+        def close(self):
+            pass
+    original = main.get_http_client
+    main.get_http_client = lambda: ConflictClient()
     try:
         response = create_order(client)
     finally:
-        module.httpx.request = original
+        main.get_http_client = original
     assert response.status_code == 409
 
 
