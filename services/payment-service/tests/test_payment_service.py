@@ -70,7 +70,7 @@ def clean_db():
 
 @pytest.fixture
 def client():
-    with TestClient(main.app) as test_client:
+    with TestClient(main.app, headers={"X-Auth-User-Id": "test-user-1", "X-Auth-User-Role": "CUSTOMER"}) as test_client:
         yield test_client
 
 
@@ -194,3 +194,18 @@ def test_failed_payment_allows_a_new_attempt(client):
     assert retry.status_code == 201
     assert retry.json()["payment_id"] != payment["payment_id"]
     assert main.razorpay_client.order.calls == 2
+
+
+def test_unauthenticated_request_is_rejected():
+    with TestClient(main.app) as unauth_client:
+        response = unauth_client.post("/payments/create-order", json={
+            "order_id": "shop-order-unauth", "amount": "10.00", "currency": "INR"
+        })
+        assert response.status_code == 401
+        assert response.json()["detail"] == "Authenticated user identity is required"
+
+
+def test_missing_razorpay_credentials_fails_startup(monkeypatch):
+    monkeypatch.setattr(main, "RAZORPAY_KEY_ID", "")
+    with pytest.raises(RuntimeError, match="RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET must be configured"):
+        main.validate_configuration()

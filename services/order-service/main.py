@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import time
 import uuid
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Generator, Optional
@@ -88,19 +89,20 @@ class CancelInput(BaseModel):
     reason: Optional[str] = Field(default=None, max_length=500)
 
 
-app = FastAPI(title="E-Commerce Order Service", version="1.0.0")
+http_client: httpx.Client | None = None
 
 
-def get_db() -> Generator[Session, None, None]:
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
+def get_http_client() -> httpx.Client:
+    global http_client
+    if http_client is None or http_client.is_closed:
+        http_client = httpx.Client(timeout=PAYMENT_TIMEOUT)
+    return http_client
 
 
-@app.on_event("startup")
-def startup() -> None:
+def init_db() -> None:
+    if str(DATABASE_URL).startswith("sqlite"):
+        Base.metadata.create_all(bind=engine)
+        return
     last_error: Exception | None = None
     for attempt in range(1, DB_CONNECT_RETRIES + 1):
         try:
@@ -116,6 +118,27 @@ def startup() -> None:
         f"Order Service could not connect to its configured database after "
         f"{DB_CONNECT_RETRIES} attempts. Check DATABASE_URL and database readiness."
     ) from last_error
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    global http_client
+    init_db()
+    http_client = httpx.Client(timeout=PAYMENT_TIMEOUT)
+    yield
+    if http_client and not http_client.is_closed:
+        http_client.close()
+
+
+app = FastAPI(title="E-Commerce Order Service", version="1.0.0", lifespan=lifespan)
+
+
+def get_db() -> Generator[Session, None, None]:
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
 
 
 def identity(x_auth_user_id: Optional[str] = Header(None), x_auth_user_role: Optional[str] = Header(None)) -> tuple[str, str]:
@@ -136,8 +159,9 @@ def _request_headers(user_id: str, role: str) -> dict[str, str]:
 
 
 def _call(method: str, url: str, *, timeout: float, headers: dict[str, str], **kwargs) -> httpx.Response:
+    client = get_http_client()
     try:
-        response = httpx.request(method, url, timeout=timeout, headers=headers, **kwargs)
+        response = client.request(method, url, timeout=timeout, headers=headers, **kwargs)
     except httpx.TimeoutException as exc:
         raise HTTPException(status_code=504, detail="A dependent service timed out") from exc
     except httpx.HTTPError as exc:

@@ -36,28 +36,35 @@ def setup_client(monkeypatch):
     payment_available = {"value": True}
     payment_status = {"value": "pending"}
 
-    def fake_request(method, url, timeout=None, headers=None, **kwargs):
-        calls.append((method, url, kwargs))
-        if "/products/" in url and method == "GET":
-            pid = url.rsplit("/", 1)[-1]
-            return FakeResponse(200, {"id": pid, "name": "Test Product", "sku": "SKU-1", "price": "12.50", "status": "PUBLISHED"})
-        if url.endswith("/inventory/reservations") and method == "POST":
-            return FakeResponse(201, {"status": "RESERVED"})
-        if url.endswith("/inventory/reservations/release") and method == "POST":
-            return FakeResponse(200, {"status": "RELEASED"})
-        if url.endswith("/payments/create-order") and method == "POST":
-            if not payment_available["value"]:
-                return FakeResponse(503, {"detail": "unavailable"})
-            body = kwargs.get("json", {})
-            return FakeResponse(201, {"payment_id": 42, "order_id": body.get("order_id"), "amount": body.get("amount"), "currency": body.get("currency"), "razorpay_order_id": "rzp_order_123", "status": "pending", "razorpay_order": {"id": "rzp_order_123"}})
-        if url.endswith("/payments/verify") and method == "POST":
-            payment_status["value"] = "success"
-            return FakeResponse(200, {"status": "success", "payment": {"id": 42, "status": "success"}})
-        if "/payments/42" in url and method == "GET":
-            return FakeResponse(200, {"id": 42, "status": payment_status["value"]})
-        return FakeResponse(404, {"detail": "not found"})
+    class FakeHttpClient:
+        def request(self, method, url, timeout=None, headers=None, **kwargs):
+            calls.append((method, url, kwargs))
+            if "/products/" in url and method == "GET":
+                pid = url.rsplit("/", 1)[-1]
+                return FakeResponse(200, {"id": pid, "name": "Test Product", "sku": "SKU-1", "price": "12.50", "status": "PUBLISHED"})
+            if url.endswith("/inventory/reservations") and method == "POST":
+                return FakeResponse(201, {"status": "RESERVED"})
+            if url.endswith("/inventory/reservations/release") and method == "POST":
+                return FakeResponse(200, {"status": "RELEASED"})
+            if url.endswith("/payments/create-order") and method == "POST":
+                if not payment_available["value"]:
+                    return FakeResponse(503, {"detail": "unavailable"})
+                body = kwargs.get("json", {})
+                return FakeResponse(201, {"payment_id": 42, "order_id": body.get("order_id"), "amount": body.get("amount"), "currency": body.get("currency"), "razorpay_order_id": "rzp_order_123", "status": "pending", "razorpay_order": {"id": "rzp_order_123"}})
+            if url.endswith("/payments/verify") and method == "POST":
+                payment_status["value"] = "success"
+                return FakeResponse(200, {"status": "success", "payment": {"id": 42, "status": "success"}})
+            if "/payments/42" in url and method == "GET":
+                return FakeResponse(200, {"id": 42, "status": payment_status["value"]})
+            return FakeResponse(404, {"detail": "not found"})
+        @property
+        def is_closed(self):
+            return False
+        def close(self):
+            pass
 
-    monkeypatch.setattr(main.httpx, "request", fake_request)
+    fake_client_instance = FakeHttpClient()
+    monkeypatch.setattr(main, "get_http_client", lambda: fake_client_instance)
     with TestClient(main.app) as client:
         yield client, calls, payment_available, payment_status
     test_engine.dispose()

@@ -5,6 +5,7 @@ fall back to SQLite if the configured database is unavailable.
 """
 from __future__ import annotations
 
+import logging
 import os
 import time
 from datetime import datetime, timezone
@@ -15,7 +16,7 @@ import razorpay
 import razorpay.errors
 from dotenv import load_dotenv
 from contextlib import asynccontextmanager
-from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi import Depends, FastAPI, Header, HTTPException, status
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -23,6 +24,8 @@ from sqlalchemy import DateTime, Index, Integer, Numeric, String, create_engine,
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 import uvicorn
+
+logger = logging.getLogger(__name__)
 
 load_dotenv()
 
@@ -98,9 +101,27 @@ def get_db() -> Generator[Session, None, None]:
         db.close()
 
 
+def require_identity(
+    x_auth_user_id: str | None = Header(None),
+    x_auth_user_role: str | None = Header(None),
+) -> tuple[str, str]:
+    if not x_auth_user_id:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authenticated user identity is required",
+        )
+    return x_auth_user_id, (x_auth_user_role or "CUSTOMER").upper()
+
+
+def validate_configuration() -> None:
+    if not RAZORPAY_KEY_ID or not RAZORPAY_KEY_SECRET:
+        raise RuntimeError("RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET must be configured")
+
+
 razorpay_client: Any = razorpay.Client(auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET))
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    validate_configuration()
     initialize_database()
     yield
 
@@ -191,7 +212,11 @@ def health() -> dict[str, Any]:
 
 
 @app.post("/payments/create-order", status_code=status.HTTP_201_CREATED)
-def create_order(payload: CreateOrderRequest, db: Session = Depends(get_db)) -> dict[str, Any]:
+def create_order(
+    payload: CreateOrderRequest,
+    db: Session = Depends(get_db),
+    _who: tuple[str, str] = Depends(require_identity),
+) -> dict[str, Any]:
     existing = db.query(PaymentRecord).filter(
         PaymentRecord.order_id == payload.order_id, PaymentRecord.status.in_(["pending", "success"])
     ).order_by(PaymentRecord.id.desc()).first()
@@ -214,9 +239,18 @@ def create_order(payload: CreateOrderRequest, db: Session = Depends(get_db)) -> 
             "receipt": f"order_rcptid_{payload.order_id}",
             "notes": {"order_id": payload.order_id},
         })
-    except Exception:
-        # Do not return upstream exception text: it may contain sensitive details.
-        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Failed to create Razorpay order")
+    except Exception as exc:
+        # Log diagnostic metadata without exposing credentials or response bodies.
+        status_code = getattr(exc, "status_code", None)
+        logger.error(
+            "Razorpay order creation failed; exception_type=%s; upstream_status=%s",
+            type(exc).__name__,
+            status_code,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Failed to create Razorpay order",
+        ) from None
 
     payment = PaymentRecord(
         order_id=payload.order_id,
@@ -250,7 +284,11 @@ def create_order(payload: CreateOrderRequest, db: Session = Depends(get_db)) -> 
 
 
 @app.post("/payments/verify")
-def verify_payment(payload: VerifyPaymentRequest, db: Session = Depends(get_db)) -> dict[str, Any]:
+def verify_payment(
+    payload: VerifyPaymentRequest,
+    db: Session = Depends(get_db),
+    _who: tuple[str, str] = Depends(require_identity),
+) -> dict[str, Any]:
     payment = db.query(PaymentRecord).filter(
         PaymentRecord.razorpay_order_id == payload.razorpay_order_id
     ).first()
@@ -287,7 +325,11 @@ def verify_payment(payload: VerifyPaymentRequest, db: Session = Depends(get_db))
 
 
 @app.get("/payments/{payment_id}")
-def get_payment(payment_id: int, db: Session = Depends(get_db)) -> dict[str, Any]:
+def get_payment(
+    payment_id: int,
+    db: Session = Depends(get_db),
+    _who: tuple[str, str] = Depends(require_identity),
+) -> dict[str, Any]:
     payment = db.query(PaymentRecord).filter(PaymentRecord.id == payment_id).first()
     if not payment:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Payment record not found")

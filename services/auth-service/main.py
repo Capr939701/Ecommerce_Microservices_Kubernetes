@@ -6,6 +6,7 @@ import os
 import secrets
 import time
 import uuid
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Generator, Optional
 
@@ -27,6 +28,8 @@ JWT_EXPIRE_MINUTES = int(os.getenv("JWT_EXPIRE_MINUTES", "1440"))
 EXPOSE_VERIFICATION_CODE = os.getenv("AUTH_EXPOSE_VERIFICATION_CODE", "false").lower() == "true"
 DB_CONNECT_RETRIES = max(1, int(os.getenv("DB_CONNECT_RETRIES", "10")))
 DB_CONNECT_RETRY_DELAY_SECONDS = max(0.1, float(os.getenv("DB_CONNECT_RETRY_DELAY_SECONDS", "2")))
+# Constant dummy hash matching scrypt format to equalize computation time when a user does not exist
+DUMMY_PASSWORD_HASH = "7510cc920455b9cfd4eb235d8fd83e63$7b6624c628d05b64b50bb52328ca0bf24eee95959d27b137e214e3427657a5402dc1de4c2756117509c26d7e1003c8fe1ab71519dbcf0b74a7c084954f407254"
 
 engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
@@ -74,7 +77,6 @@ class UserProfile(Base):
     email: Mapped[str] = mapped_column(String(320), nullable=False)
     user: Mapped[User] = relationship(back_populates="profile")
 
-app = FastAPI(title="User/Auth Service", version="2.0.0")
 
 def now() -> datetime:
     return datetime.now(timezone.utc)
@@ -89,6 +91,9 @@ def get_db() -> Generator[Session, None, None]:
 def init_db() -> None:
     if not JWT_SECRET or len(JWT_SECRET) < 32:
         raise RuntimeError("JWT_SECRET must be configured and contain at least 32 characters")
+    if str(DATABASE_URL).startswith("sqlite"):
+        Base.metadata.create_all(bind=engine)
+        return
     last_error: Exception | None = None
     for attempt in range(1, DB_CONNECT_RETRIES + 1):
         try:
@@ -105,9 +110,14 @@ def init_db() -> None:
         f"{DB_CONNECT_RETRIES} attempts. Check DATABASE_URL and database readiness."
     ) from last_error
 
-@app.on_event("startup")
-def startup() -> None:
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
     init_db()
+    yield
+
+
+app = FastAPI(title="User/Auth Service", version="2.0.0", lifespan=lifespan)
 
 def hash_password(password: str) -> str:
     salt = secrets.token_bytes(16)
@@ -170,7 +180,7 @@ def health(db: Session = Depends(get_db)):
 def register(data: RegisterIn, db: Session = Depends(get_db)):
     normalized_email = str(data.email).lower()
     current = now()
-    code = f"{secrets.randbelow(90000) + 10000}"
+    code = f"{secrets.randbelow(900000) + 100000}"
     user = User(name=data.name.strip(), email=normalized_email, password_hash=hash_password(data.password),
                 role="CUSTOMER", verified=False, status="PENDING", created_at=current)
     user.profile = UserProfile(name=data.name.strip(), email=normalized_email)
@@ -212,8 +222,14 @@ def verify_email(data: VerifyEmailIn, db: Session = Depends(get_db)):
 @app.post("/auth/login")
 def login(data: LoginIn, x_forwarded_for: Optional[str] = Header(None), user_agent: Optional[str] = Header(None), db: Session = Depends(get_db)):
     user = db.scalar(select(User).where(User.email == str(data.email).lower()))
-    password_ok = bool(user and check_password(data.password, user.password_hash))
-    success = bool(password_ok and user.verified and user.status == "ACTIVE")
+    if user:
+        password_ok = check_password(data.password, user.password_hash)
+    else:
+        # Run constant-time scrypt check against dummy hash to prevent user enumeration via timing
+        check_password(data.password, DUMMY_PASSWORD_HASH)
+        password_ok = False
+
+    success = bool(user and password_ok and user.verified and user.status == "ACTIVE")
     db.add(LoginHistory(user_id=user.id if user else None, attempt="SUCCESS" if success else "FAILED",
                         ip=(x_forwarded_for or "")[:255], user_agent=(user_agent or "")[:1000], created_at=now()))
     db.commit()
@@ -243,6 +259,8 @@ def create_user_profile(data: UserProfileIn, x_auth_user_id: Optional[str] = Hea
     if user.profile:
         raise HTTPException(status_code=409, detail="A profile already exists for this account")
     profile = UserProfile(auth_user_id=user.id, name=data.name.strip(), email=str(data.email).lower())
+    user.name = profile.name
+    user.email = profile.email
     db.add(profile)
     try:
         db.commit()

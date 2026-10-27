@@ -61,7 +61,7 @@ def test_product_create_and_inventory_are_created_together(client):
     product = make_product(client, stock=7)
     assert product["stock"] == 7
     assert product["stockStatus"] == "In Stock"
-    inventory = client.get(f"/inventorys/{product['id']}")
+    inventory = client.get(f"/inventory/{product['id']}")
     assert inventory.status_code == 200
     assert inventory.json()["quantity"] == 7
 
@@ -95,7 +95,7 @@ def test_reservation_decrements_stock_and_is_idempotent(client):
     second = client.post("/inventory/reservations", headers=CUSTOMER, json=payload)
     assert second.status_code == 201, second.text
     assert second.json()["idempotent"] is True
-    assert client.get(f"/inventorys/{product['id']}").json()["quantity"] == 3
+    assert client.get(f"/inventory/{product['id']}").json()["quantity"] == 3
 
 
 def test_insufficient_stock_does_not_decrement(client):
@@ -104,7 +104,7 @@ def test_insufficient_stock_does_not_decrement(client):
         "order_id": "ORDER-2", "items": [{"product_id": product["id"], "quantity": 2}],
     })
     assert response.status_code == 409
-    assert client.get(f"/inventorys/{product['id']}").json()["quantity"] == 1
+    assert client.get(f"/inventory/{product['id']}").json()["quantity"] == 1
 
 
 def test_release_restores_stock_only_once(client):
@@ -116,11 +116,24 @@ def test_release_restores_stock_only_once(client):
     second = client.post("/inventory/reservations/release", headers=CUSTOMER, json=release_payload)
     assert first.status_code == 200 and second.status_code == 200
     assert second.json()["idempotent"] is True
-    assert client.get(f"/inventorys/{product['id']}").json()["quantity"] == 4
+    assert client.get(f"/inventory/{product['id']}").json()["quantity"] == 4
 
 
 def test_missing_product_returns_404(client):
     assert client.get("/products/no-such-product").status_code == 404
+
+
+def test_unpublished_product_hidden_from_public(client):
+    product = make_product(client)
+    # Delete / unpublish product as admin
+    res = client.delete(f"/products/{product['id']}", headers=ADMIN)
+    assert res.status_code == 204
+    # Public request returns 404
+    assert client.get(f"/products/{product['id']}").status_code == 404
+    # Admin request can still view it
+    admin_res = client.get(f"/products/{product['id']}", headers=ADMIN)
+    assert admin_res.status_code == 200
+    assert admin_res.json()["status"] == "UNPUBLISHED"
 
 
 def test_invalid_stock_value_is_rejected(client):

@@ -34,14 +34,21 @@ def setup_client(monkeypatch):
     cart.Base.metadata.create_all(bind=engine)
     product = {"id": "p1", "sku": "SKU-1", "name": "Demo", "price": "12.50", "stock": 5, "status": "PUBLISHED"}
     calls = []
-    def fake_get(url, timeout=None, headers=None):
-        calls.append(("GET", url, headers))
-        return FakeResponse(200, product)
-    def fake_post(url, json=None, timeout=None, headers=None):
-        calls.append(("POST", url, json, headers))
-        return FakeResponse(201, {"id": "order-1", "status": "PAYMENT_PENDING", "items": json["items"]})
-    monkeypatch.setattr(cart.httpx, "get", fake_get)
-    monkeypatch.setattr(cart.httpx, "post", fake_post)
+    class FakeHttpClient:
+        def get(self, url, timeout=None, headers=None):
+            calls.append(("GET", url, headers))
+            return FakeResponse(200, product)
+        def post(self, url, json=None, timeout=None, headers=None):
+            calls.append(("POST", url, json, headers))
+            return FakeResponse(201, {"id": "order-1", "status": "PAYMENT_PENDING", "items": json["items"]})
+        @property
+        def is_closed(self):
+            return False
+        def close(self):
+            pass
+
+    fake_client_instance = FakeHttpClient()
+    monkeypatch.setattr(cart, "get_http_client", lambda: fake_client_instance)
     with TestClient(cart.app) as client:
         yield client, calls, product
     engine.dispose()

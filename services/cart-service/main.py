@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import time
+from contextlib import asynccontextmanager
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Generator, Optional
 
@@ -44,22 +45,20 @@ class CartItemUpdate(BaseModel):
 class CheckoutRequest(BaseModel):
     currency: str = Field(default="INR", min_length=3, max_length=3)
 
-app = FastAPI(title="E-Commerce Cart Service", version="1.0.0")
+http_client: httpx.Client | None = None
 
-def get_db() -> Generator[Session, None, None]:
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
 
-def identity(x_auth_user_id: Optional[str] = Header(None), x_auth_user_role: Optional[str] = Header(None)) -> tuple[str, str]:
-    if not x_auth_user_id:
-        raise HTTPException(status_code=401, detail="Authenticated user identity is required")
-    return x_auth_user_id, (x_auth_user_role or "CUSTOMER").upper()
+def get_http_client() -> httpx.Client:
+    global http_client
+    if http_client is None or http_client.is_closed:
+        http_client = httpx.Client(timeout=ORDER_TIMEOUT)
+    return http_client
 
-@app.on_event("startup")
-def startup() -> None:
+
+def init_db() -> None:
+    if str(DATABASE_URL).startswith("sqlite"):
+        Base.metadata.create_all(bind=engine)
+        return
     last_error: Exception | None = None
     for attempt in range(1, DB_CONNECT_RETRIES + 1):
         try:
@@ -76,10 +75,36 @@ def startup() -> None:
         f"{DB_CONNECT_RETRIES} attempts. Check DATABASE_URL and database readiness."
     ) from last_error
 
-def fetch_product(product_id: str, user_id: str, role: str) -> dict:
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    global http_client
+    init_db()
+    http_client = httpx.Client(timeout=ORDER_TIMEOUT)
+    yield
+    if http_client and not http_client.is_closed:
+        http_client.close()
+
+
+app = FastAPI(title="E-Commerce Cart Service", version="1.0.0", lifespan=lifespan)
+
+def get_db() -> Generator[Session, None, None]:
+    db = SessionLocal()
     try:
-        response = httpx.get(f"{PRODUCT_SERVICE_URL}/products/{product_id}", timeout=PRODUCT_TIMEOUT,
-                             headers={"X-Auth-User-Id": user_id, "X-Auth-User-Role": role})
+        yield db
+    finally:
+        db.close()
+
+def identity(x_auth_user_id: Optional[str] = Header(None), x_auth_user_role: Optional[str] = Header(None)) -> tuple[str, str]:
+    if not x_auth_user_id:
+        raise HTTPException(status_code=401, detail="Authenticated user identity is required")
+    return x_auth_user_id, (x_auth_user_role or "CUSTOMER").upper()
+
+def fetch_product(product_id: str, user_id: str, role: str) -> dict:
+    client = get_http_client()
+    try:
+        response = client.get(f"{PRODUCT_SERVICE_URL}/products/{product_id}", timeout=PRODUCT_TIMEOUT,
+                              headers={"X-Auth-User-Id": user_id, "X-Auth-User-Role": role})
     except httpx.TimeoutException as exc:
         raise HTTPException(status_code=504, detail="Product Service timed out") from exc
     except httpx.HTTPError as exc:
@@ -182,9 +207,10 @@ def checkout(details: CheckoutRequest, db: Session = Depends(get_db), who: tuple
         raise HTTPException(status_code=400, detail="Cart is empty")
     payload = {"items": [{"product_id": row.product_id, "quantity": row.quantity} for row in rows],
                "currency": details.currency.upper()}
+    client = get_http_client()
     try:
-        response = httpx.post(f"{ORDER_SERVICE_URL}/orders", json=payload, timeout=ORDER_TIMEOUT,
-                              headers={"X-Auth-User-Id": user_id, "X-Auth-User-Role": role})
+        response = client.post(f"{ORDER_SERVICE_URL}/orders", json=payload, timeout=ORDER_TIMEOUT,
+                               headers={"X-Auth-User-Id": user_id, "X-Auth-User-Role": role})
     except httpx.TimeoutException as exc:
         raise HTTPException(status_code=504, detail="Order Service timed out; check order history before retrying") from exc
     except httpx.HTTPError as exc:

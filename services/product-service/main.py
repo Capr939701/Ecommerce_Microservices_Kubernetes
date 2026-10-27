@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import time
 import uuid
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Generator, Optional
@@ -107,19 +108,10 @@ class ReleaseRequest(BaseModel):
     order_id: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=100)]
 
 
-app = FastAPI(title="E-Commerce Product & Inventory Service", version="1.0.0")
-
-
-def get_db() -> Generator[Session, None, None]:
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
-
-
-@app.on_event("startup")
-def startup() -> None:
+def init_db() -> None:
+    if str(DATABASE_URL).startswith("sqlite"):
+        Base.metadata.create_all(bind=engine)
+        return
     last_error: Exception | None = None
     for attempt in range(1, DB_CONNECT_RETRIES + 1):
         try:
@@ -135,6 +127,23 @@ def startup() -> None:
         f"Product Service could not connect to its configured database after "
         f"{DB_CONNECT_RETRIES} attempts. Check DATABASE_URL and database readiness."
     ) from last_error
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    init_db()
+    yield
+
+
+app = FastAPI(title="E-Commerce Product & Inventory Service", version="1.0.0", lifespan=lifespan)
+
+
+def get_db() -> Generator[Session, None, None]:
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
 
 
 def require_identity(x_auth_user_id: Optional[str] = Header(None), x_auth_user_role: Optional[str] = Header(None)) -> tuple[str, str]:
@@ -209,9 +218,17 @@ def create_product(data: ProductCreate, db: Session = Depends(get_db), _identity
 
 
 @app.get("/products/{product_id}")
-def get_product(product_id: str, db: Session = Depends(get_db)) -> dict:
+def get_product(
+    product_id: str,
+    db: Session = Depends(get_db),
+    x_auth_user_role: Optional[str] = Header(None),
+) -> dict:
     product = db.scalar(select(Product).where(Product.id == product_id))
     if not product:
+        raise HTTPException(status_code=404, detail="Product not found")
+    # Non-admin / unauthenticated users may only retrieve PUBLISHED products
+    role = (x_auth_user_role or "CUSTOMER").upper()
+    if product.status != "PUBLISHED" and role not in {"ADMIN", "PRODUCT_MANAGER"}:
         raise HTTPException(status_code=404, detail="Product not found")
     return product_payload(product)
 
@@ -243,7 +260,7 @@ def delete_product(product_id: str, db: Session = Depends(get_db), _identity: tu
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
-@app.get("/inventorys/{product_id}")
+@app.get("/inventory/{product_id}")
 def get_inventory(product_id: str, db: Session = Depends(get_db)) -> dict:
     inventory = db.scalar(select(Inventory).where((Inventory.product_id == product_id) | (Inventory.id == product_id)))
     if not inventory:
@@ -251,7 +268,7 @@ def get_inventory(product_id: str, db: Session = Depends(get_db)) -> dict:
     return {"id": inventory.id, "productId": inventory.product_id, "sku": inventory.sku, "quantity": inventory.quantity, "stockStatus": "In Stock" if inventory.quantity > 0 else "Out of Stock", "updatedAt": inventory.updated_at.isoformat()}
 
 
-@app.put("/inventorys/{product_id}")
+@app.put("/inventory/{product_id}")
 def update_inventory(product_id: str, data: StockUpdate, db: Session = Depends(get_db), _identity: tuple[str, str] = Depends(require_admin)) -> dict:
     inventory = db.scalar(select(Inventory).where((Inventory.product_id == product_id) | (Inventory.id == product_id)).with_for_update())
     if not inventory:

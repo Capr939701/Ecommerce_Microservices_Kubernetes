@@ -261,11 +261,11 @@ def run_suite() -> int:
         log_test("Product Update (Price & Description)", Decimal(str(prod_patch.get("price"))) == Decimal("1450.00"))
 
         # Inventory retrieval
-        status, inv_get = request_json("GET", f"/inventorys/{test_product_id}", token=admin_token, expected_status=200)
+        status, inv_get = request_json("GET", f"/inventory/{test_product_id}", token=admin_token, expected_status=200)
         log_test("Inventory Retrieval", inv_get.get("quantity") == 25)
 
         # Inventory stock update
-        status, inv_put = request_json("PUT", f"/inventorys/{test_product_id}", payload={
+        status, inv_put = request_json("PUT", f"/inventory/{test_product_id}", payload={
             "quantity": 30,
         }, token=admin_token, expected_status=200)
         log_test("Inventory Stock Update", inv_put.get("quantity") == 30)
@@ -329,7 +329,7 @@ def run_suite() -> int:
         log_test("Cart Automatically Cleared After Checkout", len(cart_post_checkout.get("items", [])) == 0)
 
         # Verify inventory was reserved (decremented)
-        status, inv_after = request_json("GET", f"/inventorys/{test_product_id}", token=admin_token, expected_status=200)
+        status, inv_after = request_json("GET", f"/inventory/{test_product_id}", token=admin_token, expected_status=200)
         log_test("Inventory Reserved for Order", inv_after.get("quantity") is not None)
 
         # ---------------------------------------------------------

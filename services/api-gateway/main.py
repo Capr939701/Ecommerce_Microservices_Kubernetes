@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from contextlib import asynccontextmanager
 from typing import Optional
 
 import httpx
@@ -19,14 +20,25 @@ PAYMENT_SERVICE_URL = os.getenv("PAYMENT_SERVICE_URL", "http://payment-service:8
 CART_SERVICE_URL = os.getenv("CART_SERVICE_URL", "http://cart-service:8005").rstrip("/")
 TIMEOUT_SECONDS = float(os.getenv("GATEWAY_TIMEOUT_SECONDS", "10"))
 
-app = FastAPI(title="E-commerce API Gateway", version="1.0.0")
+
+def validate_configuration() -> None:
+    if not JWT_SECRET or len(JWT_SECRET) < 32:
+        raise RuntimeError("JWT_SECRET must be configured and contain at least 32 characters")
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    validate_configuration()
+    yield
+
+
+app = FastAPI(title="E-commerce API Gateway", version="1.0.0", lifespan=lifespan)
 
 # Paths are deliberately explicit so the gateway has a predictable service contract.
 ROUTES = (
     ("/auth", USER_AUTH_URL),
     ("/users", USER_AUTH_URL),
     ("/products", PRODUCT_SERVICE_URL),
-    ("/inventorys", PRODUCT_SERVICE_URL),
     ("/inventory", PRODUCT_SERVICE_URL),
     ("/cart", CART_SERVICE_URL),
     ("/orders", ORDER_SERVICE_URL),
@@ -38,17 +50,10 @@ PUBLIC_EXACT = {
     ("POST", "/auth/login"),
     ("POST", "/auth/verify-token"),
 }
-PUBLIC_PREFIXES = ("/products",)
 HOP_BY_HOP_HEADERS = {
     "connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te",
     "trailers", "transfer-encoding", "upgrade", "host", "content-length",
 }
-
-
-@app.on_event("startup")
-def validate_configuration() -> None:
-    if not JWT_SECRET or len(JWT_SECRET) < 32:
-        raise RuntimeError("JWT_SECRET must be configured and contain at least 32 characters")
 
 
 @app.get("/health")
@@ -69,7 +74,7 @@ def requires_auth(method: str, path: str) -> bool:
     # Product catalogue reads are public; mutations are protected.
     if path == "/products" or path.startswith("/products/"):
         return method.upper() not in {"GET", "HEAD"}
-    return path.startswith(("/users", "/inventorys", "/inventory", "/cart", "/orders", "/payments"))
+    return path.startswith(("/users", "/inventory", "/cart", "/orders", "/payments"))
 
 
 def verify_bearer(value: Optional[str]) -> Optional[dict]:
