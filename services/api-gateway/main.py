@@ -84,7 +84,7 @@ def verify_bearer(value: Optional[str]) -> Optional[dict]:
     if not token:
         return None
     try:
-        return jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        return jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM], leeway=30)
     except jwt.PyJWTError:
         return None
 
