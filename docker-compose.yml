@@ -1,0 +1,202 @@
+name: ecommerce-microservices
+
+services:
+  auth-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: auth_db
+      POSTGRES_USER: auth_user
+      POSTGRES_PASSWORD: ${AUTH_DB_PASSWORD:?Set AUTH_DB_PASSWORD in .env}
+    volumes:
+      - auth-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 15
+      start_period: 5s
+    restart: unless-stopped
+
+  user-auth-service:
+    build: { context: ./services/auth-service }
+    environment:
+      DATABASE_URL: postgresql+psycopg2://auth_user:${AUTH_DB_PASSWORD}@auth-db:5432/auth_db
+      JWT_SECRET: ${JWT_SECRET:?Set JWT_SECRET in .env (at least 32 characters)}
+      JWT_EXPIRE_MINUTES: ${JWT_EXPIRE_MINUTES:-1440}
+      AUTH_EXPOSE_VERIFICATION_CODE: ${AUTH_EXPOSE_VERIFICATION_CODE:-true}
+    expose: ["8001"]
+    depends_on:
+      auth-db: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    restart: unless-stopped
+
+  product-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: product_db
+      POSTGRES_USER: product_user
+      POSTGRES_PASSWORD: ${PRODUCT_DB_PASSWORD:?Set PRODUCT_DB_PASSWORD in .env}
+    volumes: ["product-data:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 15
+    restart: unless-stopped
+
+  product-service:
+    build: { context: ./services/product-service }
+    environment:
+      DATABASE_URL: postgresql+psycopg2://product_user:${PRODUCT_DB_PASSWORD}@product-db:5432/product_db
+    expose: ["8002"]
+    depends_on:
+      product-db: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8002/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    restart: unless-stopped
+
+  payment-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: payment_db
+      POSTGRES_USER: payment_user
+      POSTGRES_PASSWORD: ${PAYMENT_DB_PASSWORD:?Set PAYMENT_DB_PASSWORD in .env}
+    volumes: ["payment-data:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 15
+    restart: unless-stopped
+
+  payment-service:
+    build: { context: ./services/payment-service }
+    environment:
+      PORT: "8003"
+      DATABASE_URL: postgresql+psycopg2://payment_user:${PAYMENT_DB_PASSWORD}@payment-db:5432/payment_db
+      RAZORPAY_KEY_ID: ${RAZORPAY_KEY_ID:?Set RAZORPAY_KEY_ID in .env}
+      RAZORPAY_KEY_SECRET: ${RAZORPAY_KEY_SECRET:?Set RAZORPAY_KEY_SECRET in .env}
+      DB_CONNECT_RETRIES: "10"
+      DB_CONNECT_RETRY_DELAY_SECONDS: "2"
+    expose: ["8003"]
+    depends_on:
+      payment-db: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8003/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 25s
+    restart: unless-stopped
+
+  order-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: order_db
+      POSTGRES_USER: order_user
+      POSTGRES_PASSWORD: ${ORDER_DB_PASSWORD:?Set ORDER_DB_PASSWORD in .env}
+    volumes: ["order-data:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 15
+    restart: unless-stopped
+
+  order-service:
+    build: { context: ./services/order-service }
+    environment:
+      PORT: "8004"
+      DATABASE_URL: postgresql+psycopg2://order_user:${ORDER_DB_PASSWORD}@order-db:5432/order_db
+      PRODUCT_SERVICE_URL: http://product-service:8002
+      PAYMENT_SERVICE_URL: http://payment-service:8003
+      PRODUCT_TIMEOUT_SECONDS: "5"
+      PAYMENT_TIMEOUT_SECONDS: "10"
+    expose: ["8004"]
+    depends_on:
+      order-db: { condition: service_healthy }
+      product-service: { condition: service_healthy }
+      payment-service: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8004/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    restart: unless-stopped
+
+  cart-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: cart_db
+      POSTGRES_USER: cart_user
+      POSTGRES_PASSWORD: ${CART_DB_PASSWORD:?Set CART_DB_PASSWORD in .env}
+    volumes: ["cart-data:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 15
+    restart: unless-stopped
+
+  cart-service:
+    build: { context: ./services/cart-service }
+    environment:
+      DATABASE_URL: postgresql+psycopg2://cart_user:${CART_DB_PASSWORD}@cart-db:5432/cart_db
+      PRODUCT_SERVICE_URL: http://product-service:8002
+      ORDER_SERVICE_URL: http://order-service:8004
+      PRODUCT_TIMEOUT_SECONDS: "5"
+      ORDER_TIMEOUT_SECONDS: "15"
+    expose: ["8005"]
+    depends_on:
+      cart-db: { condition: service_healthy }
+      product-service: { condition: service_healthy }
+      order-service: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8005/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    restart: unless-stopped
+
+  api-gateway:
+    build: { context: ./services/api-gateway }
+    environment:
+      JWT_SECRET: ${JWT_SECRET:?Set JWT_SECRET in .env (at least 32 characters)}
+      USER_AUTH_URL: http://user-auth-service:8001
+      PRODUCT_SERVICE_URL: http://product-service:8002
+      ORDER_SERVICE_URL: http://order-service:8004
+      PAYMENT_SERVICE_URL: http://payment-service:8003
+      CART_SERVICE_URL: http://cart-service:8005
+      GATEWAY_TIMEOUT_SECONDS: ${GATEWAY_TIMEOUT_SECONDS:-10}
+    ports: ["${GATEWAY_PORT:-8000}:8000"]
+    depends_on:
+      user-auth-service: { condition: service_healthy }
+      product-service: { condition: service_healthy }
+      order-service: { condition: service_healthy }
+      payment-service: { condition: service_healthy }
+      cart-service: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+    restart: unless-stopped
+
+volumes:
+  auth-data:
+  product-data:
+  payment-data:
+  order-data:
+  cart-data:

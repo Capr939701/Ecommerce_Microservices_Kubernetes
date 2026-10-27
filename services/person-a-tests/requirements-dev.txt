@@ -1,0 +1,3 @@
+-r auth-service/requirements.txt
+-r api-gateway/requirements.txt
+pytest==8.3.5
