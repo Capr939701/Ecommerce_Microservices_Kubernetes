@@ -9,3 +9,28 @@ __pycache__/
 venv/
 .pytest_cache/
 .DS_Store
+
+# Environment files and secrets
+.env.*
+!.env.example
+!.env.*.example
+
+# Python virtual environments
+env/
+ENV/
+
+# Credentials and private keys
+*.pem
+*.key
+secrets.yaml
+secrets.yml
+credentials.json
+
+# Test and tool artifacts
+.pytest_cache/
+.coverage
+htmlcov/
+
+# IDE settings
+.vscode/
+.idea/
