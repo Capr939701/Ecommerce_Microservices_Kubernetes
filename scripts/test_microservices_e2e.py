@@ -13,9 +13,9 @@ Executes tests against the API Gateway covering:
 """
 from __future__ import annotations
 
+import getpass
 import json
 import os
-import re
 import sys
 import time
 import urllib.error
@@ -23,7 +23,7 @@ import urllib.request
 import uuid
 from decimal import Decimal
 
-GATEWAY_URL = os.getenv("GATEWAY_URL", "http://localhost:8000").rstrip("/")
+GATEWAY_URL = os.getenv("GATEWAY_URL", "http://127.0.0.1:8000").rstrip("/")
 
 PASS_COUNT = 0
 FAIL_COUNT = 0
@@ -78,20 +78,26 @@ def request_json(
         return status, body
 
 
-def get_admin_password() -> str | None:
-    """Find the user password for testcustomer@example.com from history or environment."""
-    env_pwd = os.getenv("ADMIN_PASSWORD")
-    if env_pwd:
-        return env_pwd
-    try:
-        with open("/home/ravigovinda/.bash_history", "r", errors="ignore") as f:
-            for line in f:
-                m = re.search(r"PASSWORD=['\"]([^'\"]+)['\"]", line)
-                if m:
-                    return m.group(1)
-    except Exception:
-        pass
-    return None
+def get_admin_credentials() -> tuple[str, str | None]:
+    """Retrieve administrator credentials via environment variable or interactive prompt.
+    
+    Does not inspect shell history, temporary files, or filesystem artifacts.
+    """
+    admin_email = os.getenv("ADMIN_EMAIL", "testcustomer@example.com").strip()
+    admin_password = os.getenv("ADMIN_PASSWORD")
+    if admin_password:
+        return admin_email, admin_password.strip()
+
+    if sys.stdin.isatty():
+        try:
+            prompted = getpass.getpass(f"Enter password for administrator ({admin_email}): ")
+            if prompted:
+                return admin_email, prompted.strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\nPassword prompt cancelled.")
+            return admin_email, None
+
+    return admin_email, None
 
 
 def run_suite() -> int:
@@ -158,7 +164,6 @@ def run_suite() -> int:
         "password": cust_password,
     }, expected_status=200)
     customer_token = login_body.get("token")
-    customer_user = login_body.get("user", {})
     log_test("Customer Login", status == 200 and bool(customer_token))
 
     status, tok_body = request_json("POST", "/auth/verify-token", payload={
@@ -180,22 +185,45 @@ def run_suite() -> int:
     log_test("Customer Forbidden From Product Creation", status == 403)
 
     # Log in with Administrator account
-    admin_password = get_admin_password()
+    admin_email, admin_password = get_admin_credentials()
     admin_token = None
-    if admin_password:
-        status, admin_login = request_json("POST", "/auth/login", payload={
-            "email": "testcustomer@example.com",
-            "password": admin_password.strip(),
-        }, expected_status=200)
-        admin_token = admin_login.get("token")
-        if admin_token:
-            status, verify_admin = request_json("POST", "/auth/verify-token", payload={"token": admin_token}, expected_status=200)
-            admin_role = verify_admin.get("user", {}).get("role")
-            log_test("Administrator Login (Existing Account)", status == 200 and admin_role == "ADMIN", f"Role: {admin_role}")
-        else:
-            log_test("Administrator Login (Existing Account)", False, "No token returned")
+    if not admin_password:
+        log_test(
+            "Administrator Login (Existing Account)",
+            False,
+            f"Administrator password for '{admin_email}' not supplied. "
+            "Please provide it via ADMIN_PASSWORD environment variable or interactive prompt."
+        )
     else:
-        log_test("Administrator Login (Existing Account)", False, "Admin password not detected in environment")
+        status, admin_login = request_json(
+            "POST",
+            "/auth/login",
+            payload={"email": admin_email, "password": admin_password},
+            expected_status={200, 401}
+        )
+        if status == 200:
+            admin_token = admin_login.get("token")
+            if admin_token:
+                status, verify_admin = request_json(
+                    "POST",
+                    "/auth/verify-token",
+                    payload={"token": admin_token},
+                    expected_status=200
+                )
+                admin_role = verify_admin.get("user", {}).get("role")
+                log_test(
+                    "Administrator Login (Existing Account)",
+                    status == 200 and admin_role == "ADMIN",
+                    f"Account: {admin_email} | Role: {admin_role}"
+                )
+            else:
+                log_test("Administrator Login (Existing Account)", False, "Login returned HTTP 200 but token was missing")
+        else:
+            log_test(
+                "Administrator Login (Existing Account)",
+                False,
+                f"Authentication failed: HTTP {status} ({admin_login.get('detail', 'Invalid email or password')})"
+            )
 
     # ---------------------------------------------------------
     # TEST GROUP 5: Product & Inventory Management (Admin)
@@ -203,7 +231,13 @@ def run_suite() -> int:
     print("\n--- 5. Product Creation, Retrieval & Inventory ---")
     test_sku = f"TEST-ITEM-{unique_suffix}"
     test_product_id = None
-    if admin_token:
+    if not admin_token:
+        log_test("Admin Product Creation", False, "Skipped: valid administrator login is required to create test products")
+        log_test("Product Retrieval by ID", False, "Skipped: test product was not created")
+        log_test("Product Update (Price & Description)", False, "Skipped: test product was not created")
+        log_test("Inventory Retrieval", False, "Skipped: test product was not created")
+        log_test("Inventory Stock Update", False, "Skipped: test product was not created")
+    else:
         status, new_prod = request_json("POST", "/products", payload={
             "sku": test_sku,
             "name": f"Automated Test Product {unique_suffix}",
@@ -213,7 +247,7 @@ def run_suite() -> int:
             "status": "PUBLISHED",
         }, token=admin_token, expected_status=201)
         test_product_id = new_prod.get("id")
-        log_test("Admin Product Creation", status == 201 and bool(test_product_id), f"Created ID: {test_product_id}")
+        log_test("Admin Product Creation", status == 201 and bool(test_product_id), f"Created SKU: {test_sku}")
 
         # Retrieve product by ID
         status, prod_get = request_json("GET", f"/products/{test_product_id}", expected_status=200)
@@ -240,92 +274,94 @@ def run_suite() -> int:
     # TEST GROUP 6: Cart Operations (Customer)
     # ---------------------------------------------------------
     print("\n--- 6. Cart Operations ---")
-    target_product_id = test_product_id or laptop.get("id")
+    if not test_product_id:
+        log_test("Cart Operations", False, "Skipped: safely preserving LAPTOP-001 by requiring an isolated test product")
+    else:
+        # Add item to cart
+        status, add_cart = request_json("POST", "/cart/items", payload={
+            "product_id": test_product_id,
+            "quantity": 2,
+        }, token=customer_token, expected_status=201)
+        log_test("Add Item to Cart", status == 201)
 
-    # Add item to cart
-    status, add_cart = request_json("POST", "/cart/items", payload={
-        "product_id": target_product_id,
-        "quantity": 2,
-    }, token=customer_token, expected_status=201)
-    log_test("Add Item to Cart", status == 201)
+        # View cart
+        status, cart_view = request_json("GET", "/cart", token=customer_token, expected_status=200)
+        items = cart_view.get("items", [])
+        log_test("View Cart Contains Item", len(items) == 1 and items[0].get("quantity") == 2)
 
-    # View cart
-    status, cart_view = request_json("GET", "/cart", token=customer_token, expected_status=200)
-    items = cart_view.get("items", [])
-    log_test("View Cart Contains Item", len(items) == 1 and items[0].get("quantity") == 2)
+        # Update item in cart
+        status, cart_upd = request_json("PUT", f"/cart/items/{test_product_id}", payload={
+            "quantity": 3,
+        }, token=customer_token, expected_status=200)
+        log_test("Update Cart Quantity", status == 200 and cart_upd.get("quantity") == 3)
 
-    # Update item in cart
-    status, cart_upd = request_json("PUT", f"/cart/items/{target_product_id}", payload={
-        "quantity": 3,
-    }, token=customer_token, expected_status=200)
-    log_test("Update Cart Quantity", status == 200 and cart_upd.get("quantity") == 3)
+        # Delete item from cart
+        status, cart_del = request_json("DELETE", f"/cart/items/{test_product_id}", token=customer_token, expected_status=200)
+        log_test("Delete Item from Cart", status == 200)
 
-    # Delete item from cart
-    status, cart_del = request_json("DELETE", f"/cart/items/{target_product_id}", token=customer_token, expected_status=200)
-    log_test("Delete Item from Cart", status == 200)
+        status, cart_empty = request_json("GET", "/cart", token=customer_token, expected_status=200)
+        log_test("Cart is Empty After Deletion", len(cart_empty.get("items", [])) == 0)
 
-    status, cart_empty = request_json("GET", "/cart", token=customer_token, expected_status=200)
-    log_test("Cart is Empty After Deletion", len(cart_empty.get("items", [])) == 0)
-
-    # Re-add item for checkout test
-    request_json("POST", "/cart/items", payload={
-        "product_id": target_product_id,
-        "quantity": 1,
-    }, token=customer_token, expected_status=201)
+        # Re-add item for checkout test
+        request_json("POST", "/cart/items", payload={
+            "product_id": test_product_id,
+            "quantity": 1,
+        }, token=customer_token, expected_status=201)
 
     # ---------------------------------------------------------
     # TEST GROUP 7: Checkout, Order Creation & Inventory Reservation
     # ---------------------------------------------------------
     print("\n--- 7. Order Creation & Inventory Reservation ---")
-    status, checkout_res = request_json("POST", "/cart/checkout", payload={
-        "currency": "INR",
-    }, token=customer_token, expected_status=201)
-    order_data = checkout_res.get("order", {})
-    order_id = order_data.get("id")
-    order_status = order_data.get("status")
-    log_test("Cart Checkout Creates Order", status == 201 and bool(order_id))
-    log_test("Order Status is PAYMENT_PENDING", order_status == "PAYMENT_PENDING")
+    if not test_product_id:
+        log_test("Order Creation & Inventory Reservation", False, "Skipped: dependent on isolated test product")
+    else:
+        status, checkout_res = request_json("POST", "/cart/checkout", payload={
+            "currency": "INR",
+        }, token=customer_token, expected_status=201)
+        order_data = checkout_res.get("order", {})
+        order_id = order_data.get("id")
+        order_status = order_data.get("status")
+        log_test("Cart Checkout Creates Order", status == 201 and bool(order_id))
+        log_test("Order Status is PAYMENT_PENDING", order_status == "PAYMENT_PENDING")
 
-    # Verify Cart was cleared by checkout
-    status, cart_post_checkout = request_json("GET", "/cart", token=customer_token, expected_status=200)
-    log_test("Cart Automatically Cleared After Checkout", len(cart_post_checkout.get("items", [])) == 0)
+        # Verify Cart was cleared by checkout
+        status, cart_post_checkout = request_json("GET", "/cart", token=customer_token, expected_status=200)
+        log_test("Cart Automatically Cleared After Checkout", len(cart_post_checkout.get("items", [])) == 0)
 
-    # Verify inventory was reserved (decremented)
-    status, inv_after = request_json("GET", f"/inventorys/{target_product_id}", token=admin_token or customer_token, expected_status=200)
-    log_test("Inventory Reserved for Order", inv_after.get("quantity") is not None)
+        # Verify inventory was reserved (decremented)
+        status, inv_after = request_json("GET", f"/inventorys/{test_product_id}", token=admin_token, expected_status=200)
+        log_test("Inventory Reserved for Order", inv_after.get("quantity") is not None)
 
-    # ---------------------------------------------------------
-    # TEST GROUP 8: Payment Processing & Verification
-    # ---------------------------------------------------------
-    print("\n--- 8. Payment Processing & Verification ---")
-    # Retrieve order payment details
-    payment_info = order_data.get("payment", {})
-    payment_id = payment_info.get("payment_id")
-    razorpay_order_id = payment_info.get("razorpay_order_id")
+        # ---------------------------------------------------------
+        # TEST GROUP 8: Payment Processing & Verification
+        # ---------------------------------------------------------
+        print("\n--- 8. Payment Processing & Verification ---")
+        payment_info = order_data.get("payment", {})
+        payment_id = payment_info.get("payment_id")
+        razorpay_order_id = payment_info.get("razorpay_order_id")
 
-    log_test("Order Contains Payment Details", bool(payment_id) or bool(order_data.get("payment_setup")))
+        log_test("Order Contains Payment Details", bool(payment_id) or bool(order_data.get("payment_setup")))
 
-    # Verify payment creation on payment-service (or expected sandbox 502 when test keys are inactive)
-    status, rzp_create = request_json("POST", "/payments/create-order", payload={
-        "order_id": order_id,
-        "amount": order_data.get("grand_total"),
-        "currency": "INR",
-    }, token=customer_token, expected_status={200, 201, 502})
-    log_test("Payment Service Handled Create-Order", status in {200, 201, 502}, f"Status: HTTP {status} ({'Sandbox Simulated / Inactive Key 502' if status == 502 else 'Created'})")
+        # Verify payment creation on payment-service (or expected sandbox 502 when test keys are inactive)
+        status, rzp_create = request_json("POST", "/payments/create-order", payload={
+            "order_id": order_id,
+            "amount": order_data.get("grand_total"),
+            "currency": "INR",
+        }, token=customer_token, expected_status={200, 201, 502})
+        log_test("Payment Service Handled Create-Order", status in {200, 201, 502}, f"Status: HTTP {status} ({'Sandbox Simulated / Inactive Key 502' if status == 502 else 'Created'})")
 
-    # Test payment verification endpoint on order-service
-    status, verify_payment = request_json("POST", f"/orders/{order_id}/payment/verify", payload={
-        "razorpay_order_id": razorpay_order_id or "rzp_order_mock",
-        "razorpay_payment_id": "pay_mock_12345",
-        "razorpay_signature": "mock_signature_test",
-    }, token=customer_token, expected_status={200, 400, 502})
-    log_test("Payment Verification Handler Executed", status in {200, 400, 502}, f"Status: HTTP {status}")
+        # Test payment verification endpoint on order-service
+        status, verify_payment = request_json("POST", f"/orders/{order_id}/payment/verify", payload={
+            "razorpay_order_id": razorpay_order_id or "rzp_order_mock",
+            "razorpay_payment_id": "pay_mock_12345",
+            "razorpay_signature": "mock_signature_test",
+        }, token=customer_token, expected_status={200, 400, 502})
+        log_test("Payment Verification Handler Executed", status in {200, 400, 502}, f"Status: HTTP {status}")
 
     # ---------------------------------------------------------
     # TEST GROUP 9: Test Data Cleanup
     # ---------------------------------------------------------
     print("\n--- 9. Safe Test Data Cleanup ---")
-    # Soft delete / unpublish only the test product created in this session
     if test_product_id and admin_token:
         status, _ = request_json("DELETE", f"/products/{test_product_id}", token=admin_token, expected_status=204)
         log_test("Test Product Soft-Deleted (Unpublished)", status == 204)
@@ -333,7 +369,7 @@ def run_suite() -> int:
     # Verify LAPTOP-001 is STILL PUBLISHED and untouched
     status, final_catalog = request_json("GET", "/products", expected_status=200)
     laptop_final = next((p for p in final_catalog.get("data", []) if p.get("sku") == "LAPTOP-001"), None)
-    log_test("LAPTOP-001 Intact After Test Suite", laptop_final is not None and laptop_final.get("stock") is not None)
+    log_test("LAPTOP-001 Intact After Test Suite", laptop_final is not None and laptop_final.get("stock") == 10)
 
     print("\n" + "=" * 70)
     print(f"AUTOMATED TEST RESULTS: {PASS_COUNT} PASSED, {FAIL_COUNT} FAILED")
