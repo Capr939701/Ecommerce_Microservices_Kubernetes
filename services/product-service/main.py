@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import time
 import uuid
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -19,6 +20,8 @@ DATABASE_URL = os.getenv("DATABASE_URL", "postgresql+psycopg2://product_user:pro
 
 if not DATABASE_URL.startswith("postgresql+"):
     raise RuntimeError("DATABASE_URL must point to PostgreSQL; SQLite is not supported for application runtime")
+DB_CONNECT_RETRIES = max(1, int(os.getenv("DB_CONNECT_RETRIES", "10")))
+DB_CONNECT_RETRY_DELAY_SECONDS = max(0.1, float(os.getenv("DB_CONNECT_RETRY_DELAY_SECONDS", "2")))
 engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
 
@@ -117,10 +120,21 @@ def get_db() -> Generator[Session, None, None]:
 
 @app.on_event("startup")
 def startup() -> None:
-    # Fail fast if the configured database is unreachable; no fallback database is used.
-    with engine.connect() as connection:
-        connection.execute(text("SELECT 1"))
-    Base.metadata.create_all(bind=engine)
+    last_error: Exception | None = None
+    for attempt in range(1, DB_CONNECT_RETRIES + 1):
+        try:
+            with engine.connect() as connection:
+                connection.execute(text("SELECT 1"))
+            Base.metadata.create_all(bind=engine)
+            return
+        except Exception as exc:
+            last_error = exc
+            if attempt < DB_CONNECT_RETRIES:
+                time.sleep(DB_CONNECT_RETRY_DELAY_SECONDS)
+    raise RuntimeError(
+        f"Product Service could not connect to its configured database after "
+        f"{DB_CONNECT_RETRIES} attempts. Check DATABASE_URL and database readiness."
+    ) from last_error
 
 
 def require_identity(x_auth_user_id: Optional[str] = Header(None), x_auth_user_role: Optional[str] = Header(None)) -> tuple[str, str]:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import time
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Generator, Optional
 
@@ -19,6 +20,8 @@ PRODUCT_SERVICE_URL = os.getenv("PRODUCT_SERVICE_URL", "http://product-service:8
 ORDER_SERVICE_URL = os.getenv("ORDER_SERVICE_URL", "http://order-service:8004").rstrip("/")
 PRODUCT_TIMEOUT = float(os.getenv("PRODUCT_TIMEOUT_SECONDS", "5"))
 ORDER_TIMEOUT = float(os.getenv("ORDER_TIMEOUT_SECONDS", "15"))
+DB_CONNECT_RETRIES = max(1, int(os.getenv("DB_CONNECT_RETRIES", "10")))
+DB_CONNECT_RETRY_DELAY_SECONDS = max(0.1, float(os.getenv("DB_CONNECT_RETRY_DELAY_SECONDS", "2")))
 engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
 
@@ -57,9 +60,21 @@ def identity(x_auth_user_id: Optional[str] = Header(None), x_auth_user_role: Opt
 
 @app.on_event("startup")
 def startup() -> None:
-    with engine.connect() as connection:
-        connection.execute(text("SELECT 1"))
-    Base.metadata.create_all(bind=engine)
+    last_error: Exception | None = None
+    for attempt in range(1, DB_CONNECT_RETRIES + 1):
+        try:
+            with engine.connect() as connection:
+                connection.execute(text("SELECT 1"))
+            Base.metadata.create_all(bind=engine)
+            return
+        except Exception as exc:
+            last_error = exc
+            if attempt < DB_CONNECT_RETRIES:
+                time.sleep(DB_CONNECT_RETRY_DELAY_SECONDS)
+    raise RuntimeError(
+        f"Cart Service could not connect to its configured database after "
+        f"{DB_CONNECT_RETRIES} attempts. Check DATABASE_URL and database readiness."
+    ) from last_error
 
 def fetch_product(product_id: str, user_id: str, role: str) -> dict:
     try:

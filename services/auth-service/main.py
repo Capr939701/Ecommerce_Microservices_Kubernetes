@@ -4,6 +4,7 @@ import hashlib
 import hmac
 import os
 import secrets
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Generator, Optional
@@ -24,6 +25,8 @@ JWT_SECRET = os.getenv("JWT_SECRET", "")
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRE_MINUTES = int(os.getenv("JWT_EXPIRE_MINUTES", "1440"))
 EXPOSE_VERIFICATION_CODE = os.getenv("AUTH_EXPOSE_VERIFICATION_CODE", "false").lower() == "true"
+DB_CONNECT_RETRIES = max(1, int(os.getenv("DB_CONNECT_RETRIES", "10")))
+DB_CONNECT_RETRY_DELAY_SECONDS = max(0.1, float(os.getenv("DB_CONNECT_RETRY_DELAY_SECONDS", "2")))
 
 engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
@@ -86,9 +89,21 @@ def get_db() -> Generator[Session, None, None]:
 def init_db() -> None:
     if not JWT_SECRET or len(JWT_SECRET) < 32:
         raise RuntimeError("JWT_SECRET must be configured and contain at least 32 characters")
-    with engine.connect() as connection:
-        connection.execute(text("SELECT 1"))
-    Base.metadata.create_all(bind=engine)
+    last_error: Exception | None = None
+    for attempt in range(1, DB_CONNECT_RETRIES + 1):
+        try:
+            with engine.connect() as connection:
+                connection.execute(text("SELECT 1"))
+            Base.metadata.create_all(bind=engine)
+            return
+        except Exception as exc:
+            last_error = exc
+            if attempt < DB_CONNECT_RETRIES:
+                time.sleep(DB_CONNECT_RETRY_DELAY_SECONDS)
+    raise RuntimeError(
+        f"Auth Service could not connect to its configured database after "
+        f"{DB_CONNECT_RETRIES} attempts. Check DATABASE_URL and database readiness."
+    ) from last_error
 
 @app.on_event("startup")
 def startup() -> None:

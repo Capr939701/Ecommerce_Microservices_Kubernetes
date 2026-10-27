@@ -510,6 +510,16 @@ spec:
             configMapKeyRef:
               name: ecommerce-config
               key: AUTH_EXPOSE_VERIFICATION_CODE
+        - name: DB_CONNECT_RETRIES
+          valueFrom:
+            configMapKeyRef:
+              name: ecommerce-config
+              key: DB_CONNECT_RETRIES
+        - name: DB_CONNECT_RETRY_DELAY_SECONDS
+          valueFrom:
+            configMapKeyRef:
+              name: ecommerce-config
+              key: DB_CONNECT_RETRY_DELAY_SECONDS
         readinessProbe:
           httpGet:
             path: /health
@@ -576,6 +586,16 @@ spec:
               key: PRODUCT_DB_PASSWORD
         - name: DATABASE_URL
           value: postgresql+psycopg2://product_user:$(PRODUCT_DB_PASSWORD)@product-db:5432/product_db
+        - name: DB_CONNECT_RETRIES
+          valueFrom:
+            configMapKeyRef:
+              name: ecommerce-config
+              key: DB_CONNECT_RETRIES
+        - name: DB_CONNECT_RETRY_DELAY_SECONDS
+          valueFrom:
+            configMapKeyRef:
+              name: ecommerce-config
+              key: DB_CONNECT_RETRY_DELAY_SECONDS
         readinessProbe:
           httpGet:
             path: /health
@@ -750,6 +770,16 @@ spec:
             configMapKeyRef:
               name: ecommerce-config
               key: PAYMENT_TIMEOUT_SECONDS
+        - name: DB_CONNECT_RETRIES
+          valueFrom:
+            configMapKeyRef:
+              name: ecommerce-config
+              key: DB_CONNECT_RETRIES
+        - name: DB_CONNECT_RETRY_DELAY_SECONDS
+          valueFrom:
+            configMapKeyRef:
+              name: ecommerce-config
+              key: DB_CONNECT_RETRY_DELAY_SECONDS
         readinessProbe:
           httpGet:
             path: /health
@@ -836,6 +866,16 @@ spec:
             configMapKeyRef:
               name: ecommerce-config
               key: ORDER_TIMEOUT_SECONDS
+        - name: DB_CONNECT_RETRIES
+          valueFrom:
+            configMapKeyRef:
+              name: ecommerce-config
+              key: DB_CONNECT_RETRIES
+        - name: DB_CONNECT_RETRY_DELAY_SECONDS
+          valueFrom:
+            configMapKeyRef:
+              name: ecommerce-config
+              key: DB_CONNECT_RETRY_DELAY_SECONDS
         readinessProbe:
           httpGet:
             path: /health
