@@ -1,3 +1,16 @@
+"""Order Processing and Orchestration Microservice.
+
+Coordinates the complete checkout-to-payment order lifecycle:
+  1. Price snapshotting: Fetches real-time item prices from Product Service and locks them
+     permanently into OrderItem records to protect against subsequent price updates.
+  2. Inventory reservation: Calls Product Service to atomically decrement and lock stock.
+  3. Payment order initialization: Calls Payment Service to register an order with Razorpay.
+  4. State machine:
+       PAYMENT_PENDING -> PAID (on valid payment signature verification)
+       PAYMENT_PENDING -> CANCELLED (on user cancellation or inventory release)
+  5. Safe compensation: Releases reserved stock upon order cancellation if unpaid.
+"""
+
 from __future__ import annotations
 
 import os
@@ -16,83 +29,145 @@ from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
 from typing_extensions import Annotated
 
+
+# =====================================================================
+# Configuration and Environment Variables
+# =====================================================================
+
 SERVICE_NAME = "order-service"
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql+psycopg2://order_user:order_pass@order-db:5432/order_db")
+DATABASE_URL = os.getenv(
+    "DATABASE_URL",
+    "postgresql+psycopg2://order_user:order_pass@order-db:5432/order_db",
+)
 PRODUCT_SERVICE_URL = os.getenv("PRODUCT_SERVICE_URL", "http://product-service:8002").rstrip("/")
 PAYMENT_SERVICE_URL = os.getenv("PAYMENT_SERVICE_URL", "http://payment-service:8003").rstrip("/")
+
 PRODUCT_TIMEOUT = float(os.getenv("PRODUCT_TIMEOUT_SECONDS", "5"))
 PAYMENT_TIMEOUT = float(os.getenv("PAYMENT_TIMEOUT_SECONDS", "10"))
 
-if not DATABASE_URL.startswith("postgresql+"):
+if not (DATABASE_URL.startswith("postgresql+") or DATABASE_URL.startswith("sqlite")):
     raise RuntimeError("DATABASE_URL must point to PostgreSQL; SQLite is not supported for application runtime")
+
 DB_CONNECT_RETRIES = max(1, int(os.getenv("DB_CONNECT_RETRIES", "10")))
 DB_CONNECT_RETRY_DELAY_SECONDS = max(0.1, float(os.getenv("DB_CONNECT_RETRY_DELAY_SECONDS", "2")))
+
 engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
 
 
+# =====================================================================
+# Database Setup and Declarative Base
+# =====================================================================
+
 class Base(DeclarativeBase):
+    """Base class for all Order Service SQLAlchemy ORM models."""
     pass
 
 
+# =====================================================================
+# SQLAlchemy Data Models
+# =====================================================================
+
 class Order(Base):
+    """Customer purchase order entity capturing status, financial totals, and payment references."""
+
     __tablename__ = "orders"
-    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+
+    id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=lambda: str(uuid.uuid4())
+    )
     user_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
     user_email: Mapped[Optional[str]] = mapped_column(String(320), nullable=True)
     user_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     user_address: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
     subtotal: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False)
     tax: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False, default=Decimal("0.00"))
     grand_total: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False)
     currency: Mapped[str] = mapped_column(String(3), nullable=False, default="INR")
     status: Mapped[str] = mapped_column(String(30), nullable=False, default="PAYMENT_PENDING", index=True)
+
     payment_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     razorpay_order_id: Mapped[Optional[str]] = mapped_column(String(128), nullable=True, index=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
-    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
-    items: Mapped[list["OrderItem"]] = relationship(back_populates="order", cascade="all, delete-orphan", lazy="selectin")
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc)
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )
+
+    # Relationships
+    items: Mapped[list["OrderItem"]] = relationship(
+        back_populates="order", cascade="all, delete-orphan", lazy="selectin"
+    )
 
 
 class OrderItem(Base):
+    """Immutable price and product snapshot captured at order placement time."""
+
     __tablename__ = "order_items"
-    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
-    order_id: Mapped[str] = mapped_column(ForeignKey("orders.id", ondelete="CASCADE"), nullable=False, index=True)
+
+    id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=lambda: str(uuid.uuid4())
+    )
+    order_id: Mapped[str] = mapped_column(
+        ForeignKey("orders.id", ondelete="CASCADE"), nullable=False, index=True
+    )
     product_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
     product_name: Mapped[str] = mapped_column(String(255), nullable=False)
     sku: Mapped[str] = mapped_column(String(32), nullable=False)
     unit_price: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False)
     quantity: Mapped[int] = mapped_column(nullable=False)
     line_total: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False)
+
+    # Relationship
     order: Mapped[Order] = relationship(back_populates="items")
 
 
+# =====================================================================
+# Pydantic Schemas for Request Validation
+# =====================================================================
+
 class OrderLineInput(BaseModel):
+    """Schema for a single product line item in an order creation request."""
     product_id: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=36)]
     quantity: int = Field(gt=0, le=10000)
 
 
 class OrderCreate(BaseModel):
+    """Schema for initiating order creation."""
     items: list[OrderLineInput] = Field(min_length=1, max_length=100)
     user_email: Optional[str] = Field(default=None, max_length=320)
     user_name: Optional[str] = Field(default=None, max_length=255)
     user_address: Optional[str] = Field(default=None, max_length=2000)
     currency: str = Field(default="INR", min_length=3, max_length=3)
 
+
 class PaymentVerifyInput(BaseModel):
+    """Schema for submitting Razorpay cryptographic payment signatures for verification."""
     razorpay_order_id: str = Field(min_length=1, max_length=128)
     razorpay_payment_id: str = Field(min_length=1, max_length=128)
     razorpay_signature: str = Field(min_length=1, max_length=512)
 
 
 class CancelInput(BaseModel):
+    """Schema for cancelling an order with optional reason."""
     reason: Optional[str] = Field(default=None, max_length=500)
 
+
+# =====================================================================
+# HTTP Client Management and Dependencies
+# =====================================================================
 
 http_client: httpx.Client | None = None
 
 
 def get_http_client() -> httpx.Client:
+    """Provide a persistent HTTP connection pool for cross-service calls."""
     global http_client
     if http_client is None or http_client.is_closed:
         http_client = httpx.Client(timeout=PAYMENT_TIMEOUT)
@@ -100,9 +175,11 @@ def get_http_client() -> httpx.Client:
 
 
 def init_db() -> None:
+    """Initialize database tables with connection retries."""
     if str(DATABASE_URL).startswith("sqlite") or str(getattr(engine, "url", "")).startswith("sqlite"):
         Base.metadata.create_all(bind=engine)
         return
+
     last_error: Exception | None = None
     for attempt in range(1, DB_CONNECT_RETRIES + 1):
         try:
@@ -114,14 +191,20 @@ def init_db() -> None:
             last_error = exc
             if attempt < DB_CONNECT_RETRIES:
                 time.sleep(DB_CONNECT_RETRY_DELAY_SECONDS)
+
     raise RuntimeError(
         f"Order Service could not connect to its configured database after "
         f"{DB_CONNECT_RETRIES} attempts. Check DATABASE_URL and database readiness."
     ) from last_error
 
 
+# =====================================================================
+# Application Lifecycle and FastAPI Setup
+# =====================================================================
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    """Application lifespan context manager for startup and shutdown."""
     global http_client
     init_db()
     http_client = httpx.Client(timeout=PAYMENT_TIMEOUT)
@@ -130,10 +213,16 @@ async def lifespan(_: FastAPI):
         http_client.close()
 
 
-app = FastAPI(title="E-Commerce Order Service", version="1.0.0", lifespan=lifespan)
+app = FastAPI(
+    title="E-Commerce Order Service",
+    version="1.0.0",
+    description="Microservice orchestrating checkout, price freezing, stock reservation, and payments",
+    lifespan=lifespan,
+)
 
 
 def get_db() -> Generator[Session, None, None]:
+    """Yield a database session and clean up on request termination."""
     db = SessionLocal()
     try:
         yield db
@@ -141,24 +230,30 @@ def get_db() -> Generator[Session, None, None]:
         db.close()
 
 
-def identity(x_auth_user_id: Optional[str] = Header(None), x_auth_user_role: Optional[str] = Header(None)) -> tuple[str, str]:
-    # These headers are only trustworthy on the private service network, injected by the gateway.
+def identity(
+    x_auth_user_id: Optional[str] = Header(None),
+    x_auth_user_role: Optional[str] = Header(None),
+) -> tuple[str, str]:
+    """Extract authenticated identity injected by the API gateway."""
     if not x_auth_user_id:
         raise HTTPException(status_code=401, detail="Authenticated user identity is required")
     return x_auth_user_id, (x_auth_user_role or "CUSTOMER").upper()
 
 
 def admin_identity(who: tuple[str, str] = Depends(identity)) -> tuple[str, str]:
+    """Verify administrator or order-manager privileges."""
     if who[1] not in {"ADMIN", "ORDER_MANAGER"}:
         raise HTTPException(status_code=403, detail="Administrator or order-manager role required")
     return who
 
 
 def _request_headers(user_id: str, role: str) -> dict[str, str]:
+    """Construct trusted internal communication headers with caller identity."""
     return {"X-Auth-User-Id": user_id, "X-Auth-User-Role": role}
 
 
 def _call(method: str, url: str, *, timeout: float, headers: dict[str, str], **kwargs) -> httpx.Response:
+    """Execute an internal HTTP request with standardized error handling."""
     client = get_http_client()
     try:
         response = client.request(method, url, timeout=timeout, headers=headers, **kwargs)
@@ -170,16 +265,20 @@ def _call(method: str, url: str, *, timeout: float, headers: dict[str, str], **k
 
 
 def _expect(response: httpx.Response, expected: set[int], service: str) -> dict:
+    """Validate HTTP response status against expected codes and extract JSON payload."""
     if response.status_code not in expected:
         try:
             detail = response.json().get("detail", "request failed")
         except Exception:
             detail = "request failed"
-        # Preserve meaningful downstream conflict/not-found responses without leaking internals.
+
+        # Preserve downstream client errors (400, 404, 409, 422) without leaking raw internals
         mapped = response.status_code if response.status_code in {400, 404, 409, 422} else 502
         raise HTTPException(status_code=mapped, detail={"service": service, "message": detail})
+
     if not response.content:
         return {}
+
     try:
         return response.json()
     except ValueError as exc:
@@ -187,20 +286,24 @@ def _expect(response: httpx.Response, expected: set[int], service: str) -> dict:
 
 
 def _order_payload(order: Order, include_payment: bool = True) -> dict:
+    """Serialize an Order entity and its frozen OrderItem snapshots into a JSON dictionary."""
     result = {
         "id": order.id,
         "user_id": order.user_id,
         "user_email": order.user_email,
         "user_name": order.user_name,
         "user_address": order.user_address,
-        "items": [{
-            "product_id": item.product_id,
-            "product_name": item.product_name,
-            "sku": item.sku,
-            "unit_price": str(item.unit_price),
-            "quantity": item.quantity,
-            "line_total": str(item.line_total),
-        } for item in order.items],
+        "items": [
+            {
+                "product_id": item.product_id,
+                "product_name": item.product_name,
+                "sku": item.sku,
+                "unit_price": str(item.unit_price),
+                "quantity": item.quantity,
+                "line_total": str(item.line_total),
+            }
+            for item in order.items
+        ],
         "subtotal": str(order.subtotal),
         "tax": str(order.tax),
         "grand_total": str(order.grand_total),
@@ -210,61 +313,139 @@ def _order_payload(order: Order, include_payment: bool = True) -> dict:
         "updated_at": order.updated_at.isoformat(),
     }
     if include_payment:
-        result["payment"] = {"payment_id": order.payment_id, "razorpay_order_id": order.razorpay_order_id}
+        result["payment"] = {
+            "payment_id": order.payment_id,
+            "razorpay_order_id": order.razorpay_order_id,
+        }
     return result
 
 
+def _create_payment_for_order(order: Order, user_id: str, role: str) -> dict:
+    """Initialize a payment record and Razorpay order via Payment Service."""
+    # Avoid duplicate payment orders if a previous successful response was persisted
+    if order.payment_id and order.razorpay_order_id:
+        return {
+            "payment_id": order.payment_id,
+            "razorpay_order_id": order.razorpay_order_id,
+            "status": "pending",
+        }
+
+    response = _call(
+        "POST",
+        f"{PAYMENT_SERVICE_URL}/payments/create-order",
+        timeout=PAYMENT_TIMEOUT,
+        headers=_request_headers(user_id, role),
+        json={"order_id": order.id, "amount": str(order.grand_total), "currency": order.currency},
+    )
+    payment = _expect(response, {200, 201}, "payment-service")
+    if not payment.get("payment_id") or not payment.get("razorpay_order_id"):
+        raise HTTPException(status_code=502, detail="Payment Service returned incomplete payment details")
+
+    return payment
+
+
+# =====================================================================
+# Route Handlers
+# =====================================================================
+
 @app.get("/health")
 def health(db: Session = Depends(get_db)) -> dict:
+    """Health check endpoint verifying PostgreSQL database readiness."""
     try:
         db.execute(text("SELECT 1"))
     except SQLAlchemyError as exc:
-        raise HTTPException(status_code=503, detail={"status": "DOWN", "service": SERVICE_NAME, "database": "DOWN"}) from exc
+        raise HTTPException(
+            status_code=503,
+            detail={"status": "DOWN", "service": SERVICE_NAME, "database": "DOWN"},
+        ) from exc
     return {"status": "UP", "service": SERVICE_NAME, "database": "UP"}
 
 
 @app.post("/orders", status_code=status.HTTP_201_CREATED)
-def create_order(data: OrderCreate, db: Session = Depends(get_db), who: tuple[str, str] = Depends(identity)) -> dict:
+def create_order(
+    data: OrderCreate,
+    db: Session = Depends(get_db),
+    who: tuple[str, str] = Depends(identity),
+) -> dict:
+    """Orchestrate end-to-end order creation.
+    
+    1. Consolidates duplicate product line entries.
+    2. Validates product availability and retrieves canonical prices from Product Service.
+    3. Persists the Order record and snapshot OrderItem records in PostgreSQL.
+    4. Reserves physical stock in Product Service (cancels order if stock is insufficient).
+    5. Dispatches payment order creation to Payment Service.
+    """
     user_id, role = who
     currency = data.currency.strip().upper()
     if len(currency) != 3 or not currency.isalpha():
         raise HTTPException(status_code=422, detail="currency must be a three-letter code")
 
-    # Merge repeated product IDs before fetching prices and reserving stock.
+    # Merge repeated product IDs before fetching prices and reserving stock
     quantities: dict[str, int] = {}
     for line in data.items:
         quantities[line.product_id] = quantities.get(line.product_id, 0) + line.quantity
 
     products: list[dict] = []
     subtotal = Decimal("0.00")
+
     for product_id, quantity in quantities.items():
-        response = _call("GET", f"{PRODUCT_SERVICE_URL}/products/{product_id}", timeout=PRODUCT_TIMEOUT, headers=_request_headers(user_id, role))
+        response = _call(
+            "GET",
+            f"{PRODUCT_SERVICE_URL}/products/{product_id}",
+            timeout=PRODUCT_TIMEOUT,
+            headers=_request_headers(user_id, role),
+        )
         product = _expect(response, {200}, "product-service")
         if product.get("status") != "PUBLISHED":
             raise HTTPException(status_code=409, detail=f"Product {product_id} is not available for purchase")
+
         try:
             price = Decimal(str(product["price"])).quantize(Decimal("0.01"))
         except Exception as exc:
             raise HTTPException(status_code=502, detail="Product Service returned an invalid price") from exc
+
         if price <= 0:
             raise HTTPException(status_code=502, detail="Product Service returned an invalid price")
+
         line_total = (price * quantity).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
         subtotal += line_total
-        products.append({"product_id": product_id, "product_name": product["name"], "sku": product["sku"], "price": price, "quantity": quantity, "line_total": line_total})
+        products.append({
+            "product_id": product_id,
+            "product_name": product["name"],
+            "sku": product["sku"],
+            "price": price,
+            "quantity": quantity,
+            "line_total": line_total,
+        })
 
     subtotal = subtotal.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-    tax = Decimal("0.00")  # Tax rules are intentionally not invented in this mini-project.
+    tax = Decimal("0.00")
     grand_total = subtotal + tax
+
     order = Order(
-        user_id=user_id, user_email=data.user_email, user_name=data.user_name,
-        user_address=data.user_address, subtotal=subtotal, tax=tax,
-        grand_total=grand_total, currency=currency, status="PAYMENT_PENDING",
+        user_id=user_id,
+        user_email=data.user_email,
+        user_name=data.user_name,
+        user_address=data.user_address,
+        subtotal=subtotal,
+        tax=tax,
+        grand_total=grand_total,
+        currency=currency,
+        status="PAYMENT_PENDING",
     )
+
     for product in products:
-        order.items.append(OrderItem(
-            product_id=product["product_id"], product_name=product["product_name"],
-            sku=product["sku"], unit_price=product["price"], quantity=product["quantity"], line_total=product["line_total"],
-        ))
+        order.items.append(
+            OrderItem(
+                product_id=product["product_id"],
+                product_name=product["product_name"],
+                sku=product["sku"],
+                unit_price=product["price"],
+                quantity=product["quantity"],
+                line_total=product["line_total"],
+            )
+        )
+
     db.add(order)
     try:
         db.commit()
@@ -273,21 +454,26 @@ def create_order(data: OrderCreate, db: Session = Depends(get_db), who: tuple[st
         db.rollback()
         raise HTTPException(status_code=503, detail="Could not persist order") from exc
 
-    # Reserve stock only after the durable order ID exists; reservation is idempotent by order ID.
+    # Reserve stock only after the durable order ID exists; reservation is idempotent by order ID
     reservation_response = _call(
-        "POST", f"{PRODUCT_SERVICE_URL}/inventory/reservations", timeout=PRODUCT_TIMEOUT,
+        "POST",
+        f"{PRODUCT_SERVICE_URL}/inventory/reservations",
+        timeout=PRODUCT_TIMEOUT,
         headers=_request_headers(user_id, role),
-        json={"order_id": order.id, "items": [{"product_id": p["product_id"], "quantity": p["quantity"]} for p in products]},
+        json={
+            "order_id": order.id,
+            "items": [{"product_id": p["product_id"], "quantity": p["quantity"]} for p in products],
+        },
     )
     try:
         _expect(reservation_response, {200, 201}, "product-service")
     except HTTPException as exc:
+        # Stock reservation conflict: mark order cancelled and propagate conflict to client
         order.status = "CANCELLED"
         db.commit()
         raise exc
 
-    # Payment creation failure does not discard the order or guess whether the remote call
-    # reached Razorpay. Keep it PAYMENT_PENDING and let the client retry /payment.
+    # Attempt to initialize Payment Service order
     try:
         payment = _create_payment_for_order(order, user_id, role)
         order.payment_id = str(payment["payment_id"])
@@ -308,113 +494,162 @@ def create_order(data: OrderCreate, db: Session = Depends(get_db), who: tuple[st
     return result
 
 
-def _create_payment_for_order(order: Order, user_id: str, role: str) -> dict:
-    # Avoid duplicate payment orders if a previous successful response was persisted.
-    if order.payment_id and order.razorpay_order_id:
-        return {"payment_id": order.payment_id, "razorpay_order_id": order.razorpay_order_id, "status": "pending"}
-    response = _call(
-        "POST", f"{PAYMENT_SERVICE_URL}/payments/create-order", timeout=PAYMENT_TIMEOUT,
-        headers=_request_headers(user_id, role),
-        json={"order_id": order.id, "amount": str(order.grand_total), "currency": order.currency},
-    )
-    payment = _expect(response, {200, 201}, "payment-service")
-    if not payment.get("payment_id") or not payment.get("razorpay_order_id"):
-        raise HTTPException(status_code=502, detail="Payment Service returned incomplete payment details")
-    # Caller persists via the route's session, below.
-    return payment
-
-
 @app.post("/orders/{order_id}/payment")
-def retry_payment(order_id: str, db: Session = Depends(get_db), who: tuple[str, str] = Depends(identity)) -> dict:
+def retry_payment(
+    order_id: str,
+    db: Session = Depends(get_db),
+    who: tuple[str, str] = Depends(identity),
+) -> dict:
+    """Retry creating a payment order for an order in PAYMENT_PENDING state."""
     user_id, role = who
     order = db.scalar(select(Order).where(Order.id == order_id))
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
+
     if order.user_id != user_id and role not in {"ADMIN", "ORDER_MANAGER"}:
         raise HTTPException(status_code=403, detail="You cannot access this order")
+
     if order.status == "PAID":
         raise HTTPException(status_code=409, detail="Order is already paid")
+
     if order.status != "PAYMENT_PENDING":
         raise HTTPException(status_code=409, detail=f"Cannot create payment for order in state {order.status}")
+
     payment = _create_payment_for_order(order, user_id, role)
     order.payment_id = str(payment["payment_id"])
     order.razorpay_order_id = payment["razorpay_order_id"]
     db.commit()
     db.refresh(order)
+
     result = _order_payload(order)
     result["razorpay_order"] = payment.get("razorpay_order")
     return result
 
 
 @app.post("/orders/{order_id}/payment/verify")
-def verify_order_payment(order_id: str, data: PaymentVerifyInput, db: Session = Depends(get_db), who: tuple[str, str] = Depends(identity)) -> dict:
+def verify_order_payment(
+    order_id: str,
+    data: PaymentVerifyInput,
+    db: Session = Depends(get_db),
+    who: tuple[str, str] = Depends(identity),
+) -> dict:
+    """Submit cryptographic payment signature to Payment Service and transition order to PAID."""
     user_id, role = who
     order = db.scalar(select(Order).where(Order.id == order_id))
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
+
     if order.user_id != user_id and role not in {"ADMIN", "ORDER_MANAGER"}:
         raise HTTPException(status_code=403, detail="You cannot access this order")
+
     if order.status == "PAID":
         return _order_payload(order)
+
     if not order.razorpay_order_id or data.razorpay_order_id != order.razorpay_order_id:
         raise HTTPException(status_code=400, detail="Payment order ID does not match this order")
+
     response = _call(
-        "POST", f"{PAYMENT_SERVICE_URL}/payments/verify", timeout=PAYMENT_TIMEOUT,
-        headers=_request_headers(user_id, role), json=data.model_dump(),
+        "POST",
+        f"{PAYMENT_SERVICE_URL}/payments/verify",
+        timeout=PAYMENT_TIMEOUT,
+        headers=_request_headers(user_id, role),
+        json=data.model_dump(),
     )
     payment = _expect(response, {200}, "payment-service")
+
     if payment.get("status") != "success":
         raise HTTPException(status_code=409, detail="Payment Service has not confirmed success")
+
     order.status = "PAID"
     order.payment_id = str(payment.get("payment", {}).get("id", order.payment_id or "")) or order.payment_id
     db.commit()
     db.refresh(order)
+
     return _order_payload(order)
 
 
 @app.get("/orders")
-def list_orders(db: Session = Depends(get_db), who: tuple[str, str] = Depends(identity)) -> dict:
+def list_orders(
+    db: Session = Depends(get_db),
+    who: tuple[str, str] = Depends(identity),
+) -> dict:
+    """List orders. Customers view only their own orders; admins view all orders."""
     user_id, role = who
     query = select(Order).order_by(Order.created_at.desc())
     if role not in {"ADMIN", "ORDER_MANAGER"}:
         query = query.where(Order.user_id == user_id)
+
     orders = db.scalars(query).all()
     return {"items": [_order_payload(order) for order in orders], "count": len(orders)}
 
 
 @app.get("/orders/{order_id}")
-def get_order(order_id: str, db: Session = Depends(get_db), who: tuple[str, str] = Depends(identity)) -> dict:
+def get_order(
+    order_id: str,
+    db: Session = Depends(get_db),
+    who: tuple[str, str] = Depends(identity),
+) -> dict:
+    """Retrieve full details of a specific order."""
     user_id, role = who
     order = db.scalar(select(Order).where(Order.id == order_id))
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
+
     if order.user_id != user_id and role not in {"ADMIN", "ORDER_MANAGER"}:
         raise HTTPException(status_code=403, detail="You cannot access this order")
+
     return _order_payload(order)
 
 
 @app.post("/orders/{order_id}/cancel")
-def cancel_order(order_id: str, data: CancelInput, db: Session = Depends(get_db), who: tuple[str, str] = Depends(identity)) -> dict:
+def cancel_order(
+    order_id: str,
+    data: CancelInput,
+    db: Session = Depends(get_db),
+    who: tuple[str, str] = Depends(identity),
+) -> dict:
+    """Cancel an unpaid order and release reserved stock back to available inventory."""
     user_id, role = who
     order = db.scalar(select(Order).where(Order.id == order_id))
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
+
     if order.user_id != user_id and role not in {"ADMIN", "ORDER_MANAGER"}:
         raise HTTPException(status_code=403, detail="You cannot access this order")
+
     if order.status == "PAID":
         raise HTTPException(status_code=409, detail="Paid orders cannot be cancelled through this endpoint")
+
     if order.status == "CANCELLED":
         return _order_payload(order)
-    # If payment was created, verify its current status before releasing reserved stock.
+
+    # If payment was initiated, verify that it was not completed before cancelling
     if order.payment_id:
-        response = _call("GET", f"{PAYMENT_SERVICE_URL}/payments/{order.payment_id}", timeout=PAYMENT_TIMEOUT, headers=_request_headers(user_id, role))
+        response = _call(
+            "GET",
+            f"{PAYMENT_SERVICE_URL}/payments/{order.payment_id}",
+            timeout=PAYMENT_TIMEOUT,
+            headers=_request_headers(user_id, role),
+        )
         payment = _expect(response, {200}, "payment-service")
         if payment.get("status") == "success":
-            raise HTTPException(status_code=409, detail="Payment is already successful; cancellation requires a refund workflow")
-    release = _call("POST", f"{PRODUCT_SERVICE_URL}/inventory/reservations/release", timeout=PRODUCT_TIMEOUT,
-                    headers=_request_headers(user_id, role), json={"order_id": order.id})
+            raise HTTPException(
+                status_code=409,
+                detail="Payment is already successful; cancellation requires a refund workflow",
+            )
+
+    # Release reserved inventory back to available stock
+    release = _call(
+        "POST",
+        f"{PRODUCT_SERVICE_URL}/inventory/reservations/release",
+        timeout=PRODUCT_TIMEOUT,
+        headers=_request_headers(user_id, role),
+        json={"order_id": order.id},
+    )
     _expect(release, {200, 404}, "product-service")
+
     order.status = "CANCELLED"
     db.commit()
     db.refresh(order)
+
     return _order_payload(order)

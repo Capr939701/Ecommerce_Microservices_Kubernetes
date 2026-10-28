@@ -20,7 +20,7 @@ The application consists of **6 FastAPI microservices** and **5 dedicated Postgr
          ▼                  ▼              ▼              ▼                  ▼
 ┌─────────────────┐ ┌───────────────┐ ┌──────────┐ ┌──────────────┐ ┌─────────────────┐
 │User/Auth Service│ │Product Service│ │Cart Svc  │ │Order Service │ │ Payment Service │
-│   (Port 8001)   │ │  (Port 8002)  │ │(Port 8005│ │ (Port 8004)  │ │   (Port 8003)   │
+│   (Port 8001)   │ │  (Port 8002)  │ │Port 8005 │ │ (Port 8004)  │ │   (Port 8003)   │
 └────────┬────────┘ └───────┬───────┘ └────┬─────┘ └──────┬───────┘ └────────┬────────┘
          │ auth-net         │ prod-net     │ cart-net     │ order-net        │ payment-net
          ▼                  ▼              ▼              ▼                  ▼
