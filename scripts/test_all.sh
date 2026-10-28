@@ -69,7 +69,11 @@ else
   exit 1
 fi
 
-# 6. Run the full End-to-End test suite
+# 6. Auto-bootstrap administrator & initial catalog if needed
+echo "Verifying / bootstrapping baseline test data..."
+"${PYTHON_BIN}" scripts/bootstrap.py || true
+
+# 7. Run the full End-to-End test suite
 echo "Running automated end-to-end integration test suite..."
 "${PYTHON_BIN}" scripts/test_microservices_e2e.py
 TEST_EXIT_CODE=$?

@@ -61,7 +61,11 @@ Write-Host " READY!" -ForegroundColor Green
 Write-Host "`n--- Container Status ---" -ForegroundColor Cyan
 docker compose ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
 
-# 5. Run test suite
+# 5. Auto-bootstrap administrator & initial catalog if needed
+Write-Host "`nVerifying / bootstrapping baseline test data..." -ForegroundColor Cyan
+python scripts/bootstrap.py
+
+# 6. Run test suite
 Write-Host "`nRunning automated end-to-end integration test suite..." -ForegroundColor Cyan
 python scripts/test_microservices_e2e.py
 $exitCode = $LASTEXITCODE
