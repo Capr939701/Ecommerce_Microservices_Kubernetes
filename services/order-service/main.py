@@ -1,14 +1,9 @@
-"""Order Processing and Orchestration Microservice.
+"""Order Microservice.
 
-Coordinates the complete checkout-to-payment order lifecycle:
-  1. Price snapshotting: Fetches real-time item prices from Product Service and locks them
-     permanently into OrderItem records to protect against subsequent price updates.
-  2. Inventory reservation: Calls Product Service to atomically decrement and lock stock.
-  3. Payment order initialization: Calls Payment Service to register an order with Razorpay.
-  4. State machine:
-       PAYMENT_PENDING -> PAID (on valid payment signature verification)
-       PAYMENT_PENDING -> CANCELLED (on user cancellation or inventory release)
-  5. Safe compensation: Releases reserved stock upon order cancellation if unpaid.
+Coordinates order creation, item calculations, stock reservation via the Product Service,
+payment initialization and signature verification via the Payment Service,
+order listing, and cancellation with inventory rollback.
+Backed by PostgreSQL (with SQLite compatibility for unit testing).
 """
 
 from __future__ import annotations
@@ -29,24 +24,23 @@ from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
 from typing_extensions import Annotated
 
-
-# =====================================================================
-# Configuration and Environment Variables
-# =====================================================================
+# ==============================================================================
+# Environment Configuration & Service Endpoints
+# ==============================================================================
 
 SERVICE_NAME = "order-service"
 DATABASE_URL = os.getenv(
     "DATABASE_URL",
     "postgresql+psycopg2://order_user:order_pass@order-db:5432/order_db",
 )
+if not (DATABASE_URL.startswith("postgresql+") or DATABASE_URL.startswith("sqlite")):
+    raise RuntimeError("DATABASE_URL must point to PostgreSQL; SQLite is not supported for application runtime")
+
 PRODUCT_SERVICE_URL = os.getenv("PRODUCT_SERVICE_URL", "http://product-service:8002").rstrip("/")
 PAYMENT_SERVICE_URL = os.getenv("PAYMENT_SERVICE_URL", "http://payment-service:8003").rstrip("/")
 
 PRODUCT_TIMEOUT = float(os.getenv("PRODUCT_TIMEOUT_SECONDS", "5"))
 PAYMENT_TIMEOUT = float(os.getenv("PAYMENT_TIMEOUT_SECONDS", "10"))
-
-if not (DATABASE_URL.startswith("postgresql+") or DATABASE_URL.startswith("sqlite")):
-    raise RuntimeError("DATABASE_URL must point to PostgreSQL; SQLite is not supported for application runtime")
 
 DB_CONNECT_RETRIES = max(1, int(os.getenv("DB_CONNECT_RETRIES", "10")))
 DB_CONNECT_RETRY_DELAY_SECONDS = max(0.1, float(os.getenv("DB_CONNECT_RETRY_DELAY_SECONDS", "2")))
@@ -55,43 +49,36 @@ engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
 
 
-# =====================================================================
-# Database Setup and Declarative Base
-# =====================================================================
+# ==============================================================================
+# Database Models (SQLAlchemy ORM)
+# ==============================================================================
 
 class Base(DeclarativeBase):
-    """Base class for all Order Service SQLAlchemy ORM models."""
+    """Declarative base class for Order Service models."""
     pass
 
 
-# =====================================================================
-# SQLAlchemy Data Models
-# =====================================================================
-
 class Order(Base):
-    """Customer purchase order entity capturing status, financial totals, and payment references."""
+    """Represents a customer purchase order and its financial lifecycle."""
 
     __tablename__ = "orders"
 
-    id: Mapped[str] = mapped_column(
-        String(36), primary_key=True, default=lambda: str(uuid.uuid4())
-    )
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     user_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
     user_email: Mapped[Optional[str]] = mapped_column(String(320), nullable=True)
     user_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     user_address: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-
     subtotal: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False)
     tax: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False, default=Decimal("0.00"))
     grand_total: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False)
     currency: Mapped[str] = mapped_column(String(3), nullable=False, default="INR")
     status: Mapped[str] = mapped_column(String(30), nullable=False, default="PAYMENT_PENDING", index=True)
-
     payment_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     razorpay_order_id: Mapped[Optional[str]] = mapped_column(String(128), nullable=True, index=True)
-
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc)
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
     )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
@@ -100,23 +87,20 @@ class Order(Base):
         onupdate=lambda: datetime.now(timezone.utc),
     )
 
-    # Relationships
     items: Mapped[list["OrderItem"]] = relationship(
-        back_populates="order", cascade="all, delete-orphan", lazy="selectin"
+        back_populates="order",
+        cascade="all, delete-orphan",
+        lazy="selectin",
     )
 
 
 class OrderItem(Base):
-    """Immutable price and product snapshot captured at order placement time."""
+    """Line item in an order capturing snapshot product details and pricing."""
 
     __tablename__ = "order_items"
 
-    id: Mapped[str] = mapped_column(
-        String(36), primary_key=True, default=lambda: str(uuid.uuid4())
-    )
-    order_id: Mapped[str] = mapped_column(
-        ForeignKey("orders.id", ondelete="CASCADE"), nullable=False, index=True
-    )
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    order_id: Mapped[str] = mapped_column(ForeignKey("orders.id", ondelete="CASCADE"), nullable=False, index=True)
     product_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
     product_name: Mapped[str] = mapped_column(String(255), nullable=False)
     sku: Mapped[str] = mapped_column(String(32), nullable=False)
@@ -124,22 +108,21 @@ class OrderItem(Base):
     quantity: Mapped[int] = mapped_column(nullable=False)
     line_total: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False)
 
-    # Relationship
     order: Mapped[Order] = relationship(back_populates="items")
 
 
-# =====================================================================
-# Pydantic Schemas for Request Validation
-# =====================================================================
+# ==============================================================================
+# Pydantic Schemas (Request / Response validation)
+# ==============================================================================
 
 class OrderLineInput(BaseModel):
-    """Schema for a single product line item in an order creation request."""
+    """Specification of an individual product and quantity to be ordered."""
     product_id: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=36)]
     quantity: int = Field(gt=0, le=10000)
 
 
 class OrderCreate(BaseModel):
-    """Schema for initiating order creation."""
+    """Payload submitted to create a new order."""
     items: list[OrderLineInput] = Field(min_length=1, max_length=100)
     user_email: Optional[str] = Field(default=None, max_length=320)
     user_name: Optional[str] = Field(default=None, max_length=255)
@@ -148,26 +131,26 @@ class OrderCreate(BaseModel):
 
 
 class PaymentVerifyInput(BaseModel):
-    """Schema for submitting Razorpay cryptographic payment signatures for verification."""
+    """Payload containing cryptographic Razorpay payment verification signatures."""
     razorpay_order_id: str = Field(min_length=1, max_length=128)
     razorpay_payment_id: str = Field(min_length=1, max_length=128)
     razorpay_signature: str = Field(min_length=1, max_length=512)
 
 
 class CancelInput(BaseModel):
-    """Schema for cancelling an order with optional reason."""
+    """Payload containing optional reason for order cancellation."""
     reason: Optional[str] = Field(default=None, max_length=500)
 
 
-# =====================================================================
-# HTTP Client Management and Dependencies
-# =====================================================================
+# ==============================================================================
+# HTTP Client Management & Database Initialization
+# ==============================================================================
 
 http_client: httpx.Client | None = None
 
 
 def get_http_client() -> httpx.Client:
-    """Provide a persistent HTTP connection pool for cross-service calls."""
+    """Retrieve or initialize the shared HTTP client for outbound service requests."""
     global http_client
     if http_client is None or http_client.is_closed:
         http_client = httpx.Client(timeout=PAYMENT_TIMEOUT)
@@ -175,7 +158,7 @@ def get_http_client() -> httpx.Client:
 
 
 def init_db() -> None:
-    """Initialize database tables with connection retries."""
+    """Initialize database tables with connection retry logic."""
     if str(DATABASE_URL).startswith("sqlite") or str(getattr(engine, "url", "")).startswith("sqlite"):
         Base.metadata.create_all(bind=engine)
         return
@@ -198,13 +181,9 @@ def init_db() -> None:
     ) from last_error
 
 
-# =====================================================================
-# Application Lifecycle and FastAPI Setup
-# =====================================================================
-
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    """Application lifespan context manager for startup and shutdown."""
+    """Lifespan context manager: initializes DB and manages HTTP client session lifecycle."""
     global http_client
     init_db()
     http_client = httpx.Client(timeout=PAYMENT_TIMEOUT)
@@ -215,14 +194,18 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="E-Commerce Order Service",
+    description="Order management and payment coordinator",
     version="1.0.0",
-    description="Microservice orchestrating checkout, price freezing, stock reservation, and payments",
     lifespan=lifespan,
 )
 
 
+# ==============================================================================
+# Dependencies & Helper Functions
+# ==============================================================================
+
 def get_db() -> Generator[Session, None, None]:
-    """Yield a database session and clean up on request termination."""
+    """Dependency that yields a database session and ensures proper closure."""
     db = SessionLocal()
     try:
         yield db
@@ -234,26 +217,26 @@ def identity(
     x_auth_user_id: Optional[str] = Header(None),
     x_auth_user_role: Optional[str] = Header(None),
 ) -> tuple[str, str]:
-    """Extract authenticated identity injected by the API gateway."""
+    """Extract authenticated identity headers injected by the API gateway."""
     if not x_auth_user_id:
         raise HTTPException(status_code=401, detail="Authenticated user identity is required")
     return x_auth_user_id, (x_auth_user_role or "CUSTOMER").upper()
 
 
 def admin_identity(who: tuple[str, str] = Depends(identity)) -> tuple[str, str]:
-    """Verify administrator or order-manager privileges."""
+    """Require administrator or order manager privileges for administrative actions."""
     if who[1] not in {"ADMIN", "ORDER_MANAGER"}:
         raise HTTPException(status_code=403, detail="Administrator or order-manager role required")
     return who
 
 
 def _request_headers(user_id: str, role: str) -> dict[str, str]:
-    """Construct trusted internal communication headers with caller identity."""
+    """Construct downstream authentication headers for internal inter-service HTTP calls."""
     return {"X-Auth-User-Id": user_id, "X-Auth-User-Role": role}
 
 
 def _call(method: str, url: str, *, timeout: float, headers: dict[str, str], **kwargs) -> httpx.Response:
-    """Execute an internal HTTP request with standardized error handling."""
+    """Execute an outbound HTTP request with standard timeout and error handling."""
     client = get_http_client()
     try:
         response = client.request(method, url, timeout=timeout, headers=headers, **kwargs)
@@ -265,14 +248,13 @@ def _call(method: str, url: str, *, timeout: float, headers: dict[str, str], **k
 
 
 def _expect(response: httpx.Response, expected: set[int], service: str) -> dict:
-    """Validate HTTP response status against expected codes and extract JSON payload."""
+    """Validate that an outbound HTTP response matches expected status codes and return JSON."""
     if response.status_code not in expected:
         try:
             detail = response.json().get("detail", "request failed")
         except Exception:
             detail = "request failed"
-
-        # Preserve downstream client errors (400, 404, 409, 422) without leaking raw internals
+        # Preserve meaningful downstream conflict/not-found responses without leaking internals
         mapped = response.status_code if response.status_code in {400, 404, 409, 422} else 502
         raise HTTPException(status_code=mapped, detail={"service": service, "message": detail})
 
@@ -286,7 +268,7 @@ def _expect(response: httpx.Response, expected: set[int], service: str) -> dict:
 
 
 def _order_payload(order: Order, include_payment: bool = True) -> dict:
-    """Serialize an Order entity and its frozen OrderItem snapshots into a JSON dictionary."""
+    """Serialize an Order and its line items into a standard response dictionary."""
     result = {
         "id": order.id,
         "user_id": order.user_id,
@@ -321,7 +303,7 @@ def _order_payload(order: Order, include_payment: bool = True) -> dict:
 
 
 def _create_payment_for_order(order: Order, user_id: str, role: str) -> dict:
-    """Initialize a payment record and Razorpay order via Payment Service."""
+    """Initialize a payment with the Payment Service for a pending order."""
     # Avoid duplicate payment orders if a previous successful response was persisted
     if order.payment_id and order.razorpay_order_id:
         return {
@@ -338,19 +320,20 @@ def _create_payment_for_order(order: Order, user_id: str, role: str) -> dict:
         json={"order_id": order.id, "amount": str(order.grand_total), "currency": order.currency},
     )
     payment = _expect(response, {200, 201}, "payment-service")
+
     if not payment.get("payment_id") or not payment.get("razorpay_order_id"):
         raise HTTPException(status_code=502, detail="Payment Service returned incomplete payment details")
 
     return payment
 
 
-# =====================================================================
-# Route Handlers
-# =====================================================================
+# ==============================================================================
+# Endpoints & Route Handlers
+# ==============================================================================
 
 @app.get("/health")
 def health(db: Session = Depends(get_db)) -> dict:
-    """Health check endpoint verifying PostgreSQL database readiness."""
+    """Service health and database probe endpoint."""
     try:
         db.execute(text("SELECT 1"))
     except SQLAlchemyError as exc:
@@ -367,13 +350,14 @@ def create_order(
     db: Session = Depends(get_db),
     who: tuple[str, str] = Depends(identity),
 ) -> dict:
-    """Orchestrate end-to-end order creation.
-    
-    1. Consolidates duplicate product line entries.
-    2. Validates product availability and retrieves canonical prices from Product Service.
-    3. Persists the Order record and snapshot OrderItem records in PostgreSQL.
-    4. Reserves physical stock in Product Service (cancels order if stock is insufficient).
-    5. Dispatches payment order creation to Payment Service.
+    """Create a new order, calculate totals, reserve stock, and initialize payment.
+
+    Flow:
+    1. Validate currency and merge duplicate product lines.
+    2. Fetch live product prices from Product Service and ensure PUBLISHED status.
+    3. Persist order with PAYMENT_PENDING status.
+    4. Call Product Service to reserve stock against order.id (rollback on failure).
+    5. Call Payment Service to create Razorpay payment order.
     """
     user_id, role = who
     currency = data.currency.strip().upper()
@@ -396,6 +380,7 @@ def create_order(
             headers=_request_headers(user_id, role),
         )
         product = _expect(response, {200}, "product-service")
+
         if product.get("status") != "PUBLISHED":
             raise HTTPException(status_code=409, detail=f"Product {product_id} is not available for purchase")
 
@@ -454,7 +439,7 @@ def create_order(
         db.rollback()
         raise HTTPException(status_code=503, detail="Could not persist order") from exc
 
-    # Reserve stock only after the durable order ID exists; reservation is idempotent by order ID
+    # Reserve stock only after durable order ID exists; reservation is idempotent by order ID
     reservation_response = _call(
         "POST",
         f"{PRODUCT_SERVICE_URL}/inventory/reservations",
@@ -465,15 +450,15 @@ def create_order(
             "items": [{"product_id": p["product_id"], "quantity": p["quantity"]} for p in products],
         },
     )
+
     try:
         _expect(reservation_response, {200, 201}, "product-service")
     except HTTPException as exc:
-        # Stock reservation conflict: mark order cancelled and propagate conflict to client
         order.status = "CANCELLED"
         db.commit()
         raise exc
 
-    # Attempt to initialize Payment Service order
+    # Attempt payment order creation; on transient failure leave PAYMENT_PENDING for client retry
     try:
         payment = _create_payment_for_order(order, user_id, role)
         order.payment_id = str(payment["payment_id"])
@@ -500,7 +485,7 @@ def retry_payment(
     db: Session = Depends(get_db),
     who: tuple[str, str] = Depends(identity),
 ) -> dict:
-    """Retry creating a payment order for an order in PAYMENT_PENDING state."""
+    """Retry payment initialization for an order in PAYMENT_PENDING state."""
     user_id, role = who
     order = db.scalar(select(Order).where(Order.id == order_id))
     if not order:
@@ -518,6 +503,7 @@ def retry_payment(
     payment = _create_payment_for_order(order, user_id, role)
     order.payment_id = str(payment["payment_id"])
     order.razorpay_order_id = payment["razorpay_order_id"]
+
     db.commit()
     db.refresh(order)
 
@@ -533,7 +519,7 @@ def verify_order_payment(
     db: Session = Depends(get_db),
     who: tuple[str, str] = Depends(identity),
 ) -> dict:
-    """Submit cryptographic payment signature to Payment Service and transition order to PAID."""
+    """Verify payment signature with Payment Service and transition order to PAID."""
     user_id, role = who
     order = db.scalar(select(Order).where(Order.id == order_id))
     if not order:
@@ -562,6 +548,7 @@ def verify_order_payment(
 
     order.status = "PAID"
     order.payment_id = str(payment.get("payment", {}).get("id", order.payment_id or "")) or order.payment_id
+
     db.commit()
     db.refresh(order)
 
@@ -573,9 +560,10 @@ def list_orders(
     db: Session = Depends(get_db),
     who: tuple[str, str] = Depends(identity),
 ) -> dict:
-    """List orders. Customers view only their own orders; admins view all orders."""
+    """List orders for the authenticated customer, or all orders if admin/manager."""
     user_id, role = who
     query = select(Order).order_by(Order.created_at.desc())
+
     if role not in {"ADMIN", "ORDER_MANAGER"}:
         query = query.where(Order.user_id == user_id)
 
@@ -589,7 +577,7 @@ def get_order(
     db: Session = Depends(get_db),
     who: tuple[str, str] = Depends(identity),
 ) -> dict:
-    """Retrieve full details of a specific order."""
+    """Retrieve full details of an individual order by ID."""
     user_id, role = who
     order = db.scalar(select(Order).where(Order.id == order_id))
     if not order:
@@ -608,7 +596,7 @@ def cancel_order(
     db: Session = Depends(get_db),
     who: tuple[str, str] = Depends(identity),
 ) -> dict:
-    """Cancel an unpaid order and release reserved stock back to available inventory."""
+    """Cancel a pending order and release its reserved inventory."""
     user_id, role = who
     order = db.scalar(select(Order).where(Order.id == order_id))
     if not order:
@@ -623,7 +611,7 @@ def cancel_order(
     if order.status == "CANCELLED":
         return _order_payload(order)
 
-    # If payment was initiated, verify that it was not completed before cancelling
+    # If payment record exists, ensure it is not already captured
     if order.payment_id:
         response = _call(
             "GET",
@@ -638,7 +626,7 @@ def cancel_order(
                 detail="Payment is already successful; cancellation requires a refund workflow",
             )
 
-    # Release reserved inventory back to available stock
+    # Release reserved inventory back into available stock
     release = _call(
         "POST",
         f"{PRODUCT_SERVICE_URL}/inventory/reservations/release",

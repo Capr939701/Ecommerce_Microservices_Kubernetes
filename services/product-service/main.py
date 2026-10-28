@@ -1,13 +1,8 @@
-"""Product Catalog and Inventory Microservice.
+"""Product & Inventory Microservice.
 
-Responsible for:
-  1. Product lifecycle management (creation, listing, updates, soft-deletion/unpublishing).
-  2. Inventory tracking and real-time stock levels.
-  3. Pessimistic concurrency control ('SELECT ... FOR UPDATE') to prevent race conditions
-     and negative stock during concurrent customer orders.
-  4. Idempotent inventory reservations keyed by Order ID.
-  5. Two-phase stock release when orders are cancelled or payments fail.
-  6. Role-based access control (Admin / Product Manager permissions for mutations).
+Handles product catalog management, SKU uniqueness, live stock tracking,
+pessimistic lock stock reservations (`with_for_update`), and stock releases on order cancellation.
+Backed by PostgreSQL (with SQLite compatibility for isolated unit testing).
 """
 
 from __future__ import annotations
@@ -39,10 +34,9 @@ from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
 from typing_extensions import Annotated
 
-
-# =====================================================================
-# Configuration and Environment Variables
-# =====================================================================
+# ==============================================================================
+# Environment Configuration & Database Setup
+# ==============================================================================
 
 SERVICE_NAME = "product-service"
 DATABASE_URL = os.getenv(
@@ -60,34 +54,30 @@ engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
 
 
-# =====================================================================
-# Database Setup and Declarative Base
-# =====================================================================
+# ==============================================================================
+# Database Models (SQLAlchemy ORM)
+# ==============================================================================
 
 class Base(DeclarativeBase):
-    """Base class for all Product Service SQLAlchemy models."""
+    """Declarative base class for Product Service models."""
     pass
 
 
-# =====================================================================
-# SQLAlchemy Data Models
-# =====================================================================
-
 class Product(Base):
-    """Product catalog item including SKU, title, description, price, and status."""
+    """Product catalog item with SKU, naming, pricing, and lifecycle status."""
 
     __tablename__ = "products"
 
-    id: Mapped[str] = mapped_column(
-        String(36), primary_key=True, default=lambda: str(uuid.uuid4())
-    )
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     sku: Mapped[str] = mapped_column(String(32), unique=True, index=True, nullable=False)
     name: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
     description: Mapped[Optional[str]] = mapped_column(String(2000), nullable=True)
     price: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False)
     status: Mapped[str] = mapped_column(String(20), default="PUBLISHED", nullable=False, index=True)
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        nullable=False,
     )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
@@ -96,22 +86,25 @@ class Product(Base):
         nullable=False,
     )
 
-    # Relationships
+    # 1:1 relationship with inventory tracking
     inventory: Mapped["Inventory"] = relationship(
-        back_populates="product", cascade="all, delete-orphan", uselist=False
+        back_populates="product",
+        cascade="all, delete-orphan",
+        uselist=False,
     )
 
 
 class Inventory(Base):
-    """Real-time inventory stock level attached 1-to-1 to a product."""
+    """Stock level entity linked 1:1 with a Product."""
 
     __tablename__ = "inventory"
 
-    id: Mapped[str] = mapped_column(
-        String(36), primary_key=True, default=lambda: str(uuid.uuid4())
-    )
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     product_id: Mapped[str] = mapped_column(
-        ForeignKey("products.id", ondelete="CASCADE"), unique=True, nullable=False, index=True
+        ForeignKey("products.id", ondelete="CASCADE"),
+        unique=True,
+        nullable=False,
+        index=True,
     )
     sku: Mapped[str] = mapped_column(String(32), unique=True, nullable=False)
     quantity: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
@@ -122,60 +115,57 @@ class Inventory(Base):
         nullable=False,
     )
 
-    # Relationship
     product: Mapped[Product] = relationship(back_populates="inventory")
 
 
 class Reservation(Base):
-    """Durable inventory reservation tying reserved quantities to an Order ID."""
+    """Stock reservation record linked to a pending order to prevent over-selling."""
 
     __tablename__ = "inventory_reservations"
-    __table_args__ = (UniqueConstraint("order_id", name="uq_inventory_reservation_order"),)
-
-    id: Mapped[str] = mapped_column(
-        String(36), primary_key=True, default=lambda: str(uuid.uuid4())
+    __table_args__ = (
+        UniqueConstraint("order_id", name="uq_inventory_reservation_order"),
     )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     order_id: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
-    status: Mapped[str] = mapped_column(String(20), default="RESERVED", nullable=False)
+    status: Mapped[str] = mapped_column(String(20), default="RESERVED", nullable=False)  # 'RESERVED' or 'RELEASED'
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        nullable=False,
     )
 
-    # Relationship
     items: Mapped[list["ReservationItem"]] = relationship(
-        back_populates="reservation", cascade="all, delete-orphan"
+        back_populates="reservation",
+        cascade="all, delete-orphan",
     )
 
 
 class ReservationItem(Base):
-    """Line-item breakdown of products and quantities held by a reservation."""
+    """Line item within an inventory reservation detailing the reserved quantity."""
 
     __tablename__ = "inventory_reservation_items"
 
-    id: Mapped[str] = mapped_column(
-        String(36), primary_key=True, default=lambda: str(uuid.uuid4())
-    )
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     reservation_id: Mapped[str] = mapped_column(
-        ForeignKey("inventory_reservations.id", ondelete="CASCADE"), nullable=False, index=True
+        ForeignKey("inventory_reservations.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
     )
     product_id: Mapped[str] = mapped_column(String(36), nullable=False)
     sku: Mapped[str] = mapped_column(String(32), nullable=False)
     quantity: Mapped[int] = mapped_column(Integer, nullable=False)
 
-    # Relationship
     reservation: Mapped[Reservation] = relationship(back_populates="items")
 
 
-# =====================================================================
-# Pydantic Schemas for Request Validation
-# =====================================================================
+# ==============================================================================
+# Pydantic Schemas (Request / Response validation)
+# ==============================================================================
 
 class ProductCreate(BaseModel):
-    """Schema for adding a new product and initializing its inventory stock."""
-    sku: Annotated[
-        str,
-        StringConstraints(strip_whitespace=True, min_length=3, max_length=32, pattern=r"^[A-Za-z0-9._-]+$"),
-    ]
+    """Payload to create a new product in the catalog."""
+    sku: Annotated[str, StringConstraints(strip_whitespace=True, min_length=3, max_length=32, pattern=r"^[A-Za-z0-9._-]+$")]
     name: Annotated[str, StringConstraints(strip_whitespace=True, min_length=2, max_length=255)]
     description: Optional[str] = Field(default=None, max_length=2000)
     price: Decimal = Field(gt=Decimal("0"), max_digits=12, decimal_places=2)
@@ -184,7 +174,7 @@ class ProductCreate(BaseModel):
 
 
 class ProductUpdate(BaseModel):
-    """Schema for updating product metadata and publication status."""
+    """Payload for partial updates to an existing product."""
     name: Optional[Annotated[str, StringConstraints(strip_whitespace=True, min_length=2, max_length=255)]] = None
     description: Optional[str] = Field(default=None, max_length=2000)
     price: Optional[Decimal] = Field(default=None, gt=Decimal("0"), max_digits=12, decimal_places=2)
@@ -192,33 +182,33 @@ class ProductUpdate(BaseModel):
 
 
 class StockUpdate(BaseModel):
-    """Schema for modifying inventory stock counts."""
+    """Payload to explicitly set the inventory stock count."""
     quantity: int = Field(ge=0, le=2_000_000_000)
 
 
 class ReservationLine(BaseModel):
-    """Schema for an individual item requested in an inventory reservation."""
+    """Individual product and quantity in an inventory reservation request."""
     product_id: str
     quantity: int = Field(gt=0, le=2_000_000_000)
 
 
 class ReservationCreate(BaseModel):
-    """Schema for creating an inventory reservation for an order."""
+    """Payload to create an inventory reservation for an order."""
     order_id: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=100)]
     items: list[ReservationLine] = Field(min_length=1, max_length=100)
 
 
 class ReleaseRequest(BaseModel):
-    """Schema for releasing previously reserved inventory stock back to availability."""
+    """Payload to release an existing inventory reservation."""
     order_id: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=100)]
 
 
-# =====================================================================
-# Database Initialization and Dependencies
-# =====================================================================
+# ==============================================================================
+# Database Initialization & Dependency
+# ==============================================================================
 
 def init_db() -> None:
-    """Initialize product and inventory database tables with auto-retries."""
+    """Initialize database tables with connection retry logic."""
     if str(DATABASE_URL).startswith("sqlite") or str(getattr(engine, "url", "")).startswith("sqlite"):
         Base.metadata.create_all(bind=engine)
         return
@@ -243,21 +233,25 @@ def init_db() -> None:
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    """Lifespan manager executing database migration on startup."""
+    """Lifespan context manager: ensures database connectivity and schema readiness on startup."""
     init_db()
     yield
 
 
 app = FastAPI(
     title="E-Commerce Product & Inventory Service",
+    description="Catalog management, inventory levels, and stock reservations",
     version="1.0.0",
-    description="Microservice managing products, stock, and transactional inventory reservations",
     lifespan=lifespan,
 )
 
 
+# ==============================================================================
+# Dependencies & Helper Functions
+# ==============================================================================
+
 def get_db() -> Generator[Session, None, None]:
-    """Yield a database session and ensure clean disposal."""
+    """Dependency yielding a database session with guaranteed closure."""
     db = SessionLocal()
     try:
         yield db
@@ -269,21 +263,21 @@ def require_identity(
     x_auth_user_id: Optional[str] = Header(None),
     x_auth_user_role: Optional[str] = Header(None),
 ) -> tuple[str, str]:
-    """Extract authenticated identity injected by the API gateway."""
+    """Validate authenticated identity headers injected by the API gateway."""
     if not x_auth_user_id:
         raise HTTPException(status_code=401, detail="Authenticated user identity is required")
     return x_auth_user_id, (x_auth_user_role or "CUSTOMER").upper()
 
 
 def require_admin(identity: tuple[str, str] = Depends(require_identity)) -> tuple[str, str]:
-    """Verify that the caller holds administrative or product-manager privileges."""
+    """Require administrator or product manager privileges."""
     if identity[1] not in {"ADMIN", "PRODUCT_MANAGER"}:
         raise HTTPException(status_code=403, detail="Administrator or product-manager role required")
     return identity
 
 
 def product_payload(product: Product, include_description: bool = True) -> dict:
-    """Serialize a product entity and its linked inventory stock into JSON-compatible dict."""
+    """Format product model into a standard JSON response dictionary."""
     inv = product.inventory
     result = {
         "id": product.id,
@@ -302,13 +296,13 @@ def product_payload(product: Product, include_description: bool = True) -> dict:
     return result
 
 
-# =====================================================================
-# Route Handlers: Health and Products
-# =====================================================================
+# ==============================================================================
+# Endpoints & Route Handlers
+# ==============================================================================
 
 @app.get("/health")
 def health(db: Session = Depends(get_db)) -> dict:
-    """Service health check verifying PostgreSQL database readiness."""
+    """Service health and database probe endpoint."""
     try:
         db.execute(text("SELECT 1"))
         return {"status": "UP", "service": SERVICE_NAME, "database": "UP"}
@@ -327,7 +321,7 @@ def list_products(
     limit: int = Query(default=50, ge=1, le=100),
     db: Session = Depends(get_db),
 ) -> dict:
-    """List products with pagination, search filtering by name/SKU, and status filtering."""
+    """List products with pagination, search, and status filtering."""
     query = select(Product).where(Product.status == "PUBLISHED")
     if status_filter:
         query = select(Product).where(Product.status == status_filter)
@@ -349,7 +343,7 @@ def create_product(
     db: Session = Depends(get_db),
     _identity: tuple[str, str] = Depends(require_admin),
 ) -> dict:
-    """Create a new catalog product with initial inventory stock (Admin only)."""
+    """Create a new product and initialize its corresponding inventory record."""
     if db.scalar(select(Product.id).where(Product.sku == data.sku)):
         raise HTTPException(status_code=409, detail="A product with this SKU already exists")
 
@@ -378,11 +372,12 @@ def get_product(
     db: Session = Depends(get_db),
     x_auth_user_role: Optional[str] = Header(None),
 ) -> dict:
-    """Retrieve full product details. Non-admins may only view PUBLISHED products."""
+    """Retrieve full product details. Non-admins cannot view draft/unpublished products."""
     product = db.scalar(select(Product).where(Product.id == product_id))
     if not product:
         raise HTTPException(status_code=404, detail="Product not found")
 
+    # Non-admin / unauthenticated users may only retrieve PUBLISHED products
     role = (x_auth_user_role or "CUSTOMER").upper()
     if product.status != "PUBLISHED" and role not in {"ADMIN", "PRODUCT_MANAGER"}:
         raise HTTPException(status_code=404, detail="Product not found")
@@ -397,7 +392,7 @@ def update_product(
     db: Session = Depends(get_db),
     _identity: tuple[str, str] = Depends(require_admin),
 ) -> dict:
-    """Partially update product details (Admin only)."""
+    """Partially update an existing product."""
     product = db.scalar(select(Product).where(Product.id == product_id))
     if not product:
         raise HTTPException(status_code=404, detail="Product not found")
@@ -420,24 +415,20 @@ def delete_product(
     db: Session = Depends(get_db),
     _identity: tuple[str, str] = Depends(require_admin),
 ) -> Response:
-    """Soft-delete a product by changing status to UNPUBLISHED (preserves order history)."""
+    """Soft-delete a product by marking it UNPUBLISHED to preserve historical order references."""
     product = db.scalar(select(Product).where(Product.id == product_id))
     if not product:
         raise HTTPException(status_code=404, detail="Product not found")
 
-    # Soft-deletion preserves foreign key references in historical order records
+    # Preserve order-history references by marking the product unpublished instead of hard-deleting
     product.status = "UNPUBLISHED"
     db.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
-# =====================================================================
-# Route Handlers: Inventory and Stock Management
-# =====================================================================
-
 @app.get("/inventory/{product_id}")
 def get_inventory(product_id: str, db: Session = Depends(get_db)) -> dict:
-    """Lookup real-time inventory quantity by product ID or inventory ID."""
+    """Look up inventory stock levels by product ID or inventory ID."""
     inventory = db.scalar(
         select(Inventory).where((Inventory.product_id == product_id) | (Inventory.id == product_id))
     )
@@ -461,7 +452,7 @@ def update_inventory(
     db: Session = Depends(get_db),
     _identity: tuple[str, str] = Depends(require_admin),
 ) -> dict:
-    """Update stock quantity with pessimistic locking (Admin only)."""
+    """Update inventory quantity with row-level locking."""
     inventory = db.scalar(
         select(Inventory)
         .where((Inventory.product_id == product_id) | (Inventory.id == product_id))
@@ -483,23 +474,15 @@ def update_inventory(
     }
 
 
-# =====================================================================
-# Route Handlers: Transactional Reservations
-# =====================================================================
-
 @app.post("/inventory/reservations", status_code=status.HTTP_201_CREATED)
 def reserve_inventory(
     data: ReservationCreate,
     db: Session = Depends(get_db),
     _identity: tuple[str, str] = Depends(require_identity),
 ) -> dict:
-    """Atomically reserve inventory for an order using pessimistic row locking.
-    
-    1. Checks if a reservation already exists for the Order ID (idempotency).
-    2. Merges duplicate product IDs in the request.
-    3. Acquires 'SELECT ... FOR UPDATE' row-level locks on inventory records.
-    4. Validates that available stock >= requested quantity.
-    5. Decrements stock and persists reservation records in a single database transaction.
+    """Atomically reserve inventory for an order using row-level locks (with_for_update).
+
+    Idempotent: If a reservation for order_id already exists and is RESERVED, returns the existing reservation.
     """
     existing = db.scalar(select(Reservation).where(Reservation.order_id == data.order_id))
     if existing:
@@ -513,7 +496,7 @@ def reserve_inventory(
             }
         raise HTTPException(status_code=409, detail=f"Order inventory reservation is already {existing.status.lower()}")
 
-    # Consolidate duplicate product entries to evaluate overall stock requirement
+    # Aggregate duplicate product lines before checking or decrementing stock
     totals: dict[str, int] = {}
     for item in data.items:
         totals[item.product_id] = totals.get(item.product_id, 0) + item.quantity
@@ -525,7 +508,6 @@ def reserve_inventory(
             db.rollback()
             raise HTTPException(status_code=404, detail=f"Published product or inventory not found: {product_id}")
 
-        # Pessimistic locking prevents concurrent checkouts from overselling inventory
         inventory = db.scalar(select(Inventory).where(Inventory.product_id == product_id).with_for_update())
         if inventory.quantity < qty:
             db.rollback()
@@ -563,7 +545,7 @@ def release_inventory(
     db: Session = Depends(get_db),
     _identity: tuple[str, str] = Depends(require_identity),
 ) -> dict:
-    """Release reserved stock back to inventory when an order is cancelled."""
+    """Release reserved stock back to the active inventory upon order cancellation."""
     reservation = db.scalar(
         select(Reservation).where(Reservation.order_id == data.order_id).with_for_update()
     )
@@ -590,7 +572,7 @@ def get_reservation(
     db: Session = Depends(get_db),
     _identity: tuple[str, str] = Depends(require_identity),
 ) -> dict:
-    """Retrieve active reservation details and items for a specific order."""
+    """Retrieve details of an existing inventory reservation by order ID."""
     reservation = db.scalar(select(Reservation).where(Reservation.order_id == order_id))
     if not reservation:
         raise HTTPException(status_code=404, detail="Reservation not found")

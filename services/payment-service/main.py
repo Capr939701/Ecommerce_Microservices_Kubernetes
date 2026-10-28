@@ -1,13 +1,8 @@
-"""Payment Microservice with Razorpay Integration.
+"""Payment Microservice.
 
-Responsible for:
-  1. Managing payment records in persistent PostgreSQL storage.
-  2. Integration with Razorpay API to generate upstream order IDs (`order_...`).
-  3. Strict idempotency: Multiple create-order requests for the same Order ID return
-     the existing active payment without duplicating Razorpay transactions.
-  4. Cryptographic HMAC-SHA256 signature verification for callback authorization.
-  5. Terminal success states: Once marked 'success', payment records are immutable
-     and cannot be reverted or overwritten by replayed requests.
+Handles Razorpay payment order creation, cryptographic webhook / frontend signature verification,
+payment status tracking, and database persistence.
+PostgreSQL is the intended runtime database (with SQLite compatibility for isolated unit testing).
 """
 
 from __future__ import annotations
@@ -32,14 +27,16 @@ from sqlalchemy import DateTime, Index, Integer, Numeric, String, create_engine,
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
-
-# =====================================================================
-# Configuration and Logging
-# =====================================================================
-
 logger = logging.getLogger(__name__)
 
-load_dotenv()
+# ==============================================================================
+# Environment Configuration & Database Setup
+# ==============================================================================
+
+try:
+    load_dotenv()
+except (PermissionError, OSError):
+    pass
 
 PORT = int(os.getenv("PORT", "8003"))
 DATABASE_URL = os.getenv(
@@ -52,30 +49,29 @@ DB_CONNECT_RETRY_DELAY_SECONDS = max(0.1, float(os.getenv("DB_CONNECT_RETRY_DELA
 RAZORPAY_KEY_ID = os.getenv("RAZORPAY_KEY_ID", "")
 RAZORPAY_KEY_SECRET = os.getenv("RAZORPAY_KEY_SECRET", "")
 
-
-# =====================================================================
-# Database Setup and Declarative Base
-# =====================================================================
-
+# SQLAlchemy engine creation does not prove the DB is reachable. Connectivity is
+# checked during startup and by /health; no alternate database is substituted.
 engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False, expire_on_commit=False)
 
 
+# ==============================================================================
+# Database Models & Constraints
+# ==============================================================================
+
 class Base(DeclarativeBase):
-    """Base class for Payment Service SQLAlchemy ORM models."""
+    """Declarative base class for Payment Service models."""
     pass
 
 
-# =====================================================================
-# SQLAlchemy Data Models
-# =====================================================================
-
 class PaymentRecord(Base):
-    """Durable record of an individual payment attempt and its Razorpay transaction state."""
+    """Represents a financial transaction record linked to an e-commerce order."""
 
     __tablename__ = "payments"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True, autoincrement=True)
+    # One payment lifecycle per e-commerce order. This DB constraint also guards
+    # concurrent create-order requests from inserting duplicate records.
     order_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
     amount: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False)
     currency: Mapped[str] = mapped_column(String(3), nullable=False, default="INR")
@@ -83,12 +79,14 @@ class PaymentRecord(Base):
     razorpay_payment_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="pending", index=True)
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc)
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
     )
 
 
-# Allow a new attempt after a failed payment, but only one pending/successful
-# payment record for an order at a time. Supported across PostgreSQL and SQLite.
+# Allow a new attempt after a failed payment, but allow only one active (pending or success)
+# payment record for an order at a time. Both PostgreSQL and SQLite support partial indexes.
 Index(
     "uq_payments_active_order",
     PaymentRecord.order_id,
@@ -98,59 +96,12 @@ Index(
 )
 
 
-# =====================================================================
-# Pydantic Schemas for Request and Response Validation
-# =====================================================================
-
-class CreateOrderRequest(BaseModel):
-    """Schema for initiating payment order creation."""
-    order_id: str = Field(min_length=1, max_length=128)
-    amount: Decimal = Field(gt=Decimal("0"), max_digits=12, decimal_places=2)
-    currency: str = Field(default="INR", min_length=3, max_length=3)
-
-    @field_validator("order_id")
-    @classmethod
-    def strip_order_id(cls, value: str) -> str:
-        value = value.strip()
-        if not value:
-            raise ValueError("order_id must not be blank")
-        return value
-
-    @field_validator("currency")
-    @classmethod
-    def normalize_currency(cls, value: str) -> str:
-        value = value.strip().upper()
-        if len(value) != 3 or not value.isalpha():
-            raise ValueError("currency must be a three-letter currency code")
-        return value
-
-
-class VerifyPaymentRequest(BaseModel):
-    """Schema for submitting Razorpay HMAC-SHA256 signature details."""
-    razorpay_order_id: str = Field(min_length=1, max_length=128)
-    razorpay_payment_id: str = Field(min_length=1, max_length=128)
-    razorpay_signature: str = Field(min_length=1, max_length=512)
-
-
-class PaymentOut(BaseModel):
-    """Schema representing payment output details."""
-    model_config = ConfigDict(from_attributes=True)
-    id: int
-    order_id: str
-    amount: Decimal
-    currency: str
-    razorpay_order_id: str
-    razorpay_payment_id: str | None
-    status: str
-    created_at: datetime
-
-
-# =====================================================================
-# Database Initialization and Dependencies
-# =====================================================================
+# ==============================================================================
+# Database Initialization & Configuration Validation
+# ==============================================================================
 
 def initialize_database() -> None:
-    """Wait for PostgreSQL database readiness and apply schema migrations."""
+    """Wait for database readiness with exponential retries and create schema tables."""
     if str(DATABASE_URL).startswith("sqlite") or str(getattr(engine, "url", "")).startswith("sqlite"):
         Base.metadata.create_all(bind=engine)
         return
@@ -173,8 +124,14 @@ def initialize_database() -> None:
     ) from last_error
 
 
+def validate_configuration() -> None:
+    """Verify that required payment gateway API keys are present."""
+    if not RAZORPAY_KEY_ID or not RAZORPAY_KEY_SECRET:
+        raise RuntimeError("RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET must be configured")
+
+
 def get_db() -> Generator[Session, None, None]:
-    """Yield a database session and ensure clean disposal."""
+    """Dependency that yields a database session and ensures proper closure."""
     db = SessionLocal()
     try:
         yield db
@@ -186,7 +143,7 @@ def require_identity(
     x_auth_user_id: str | None = Header(None),
     x_auth_user_role: str | None = Header(None),
 ) -> tuple[str, str]:
-    """Extract authenticated identity injected by the API gateway."""
+    """Validate authenticated identity headers injected by the API gateway."""
     if not x_auth_user_id:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -195,22 +152,16 @@ def require_identity(
     return x_auth_user_id, (x_auth_user_role or "CUSTOMER").upper()
 
 
-def validate_configuration() -> None:
-    """Validate presence of Razorpay API credentials."""
-    if not RAZORPAY_KEY_ID or not RAZORPAY_KEY_SECRET:
-        raise RuntimeError("RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET must be configured")
-
+# ==============================================================================
+# Application Lifespan & FastAPI App Setup
+# ==============================================================================
 
 razorpay_client: Any = razorpay.Client(auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET))
 
 
-# =====================================================================
-# Application Lifecycle and FastAPI Setup
-# =====================================================================
-
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    """Lifecycle manager validating credentials and initializing database."""
+    """Lifespan context manager: validates configuration and initializes database schema."""
     validate_configuration()
     initialize_database()
     yield
@@ -224,8 +175,60 @@ app = FastAPI(
 )
 
 
+# ==============================================================================
+# Pydantic Schemas (Request / Response validation)
+# ==============================================================================
+
+class CreateOrderRequest(BaseModel):
+    """Request payload to initiate a new Razorpay payment order."""
+    order_id: str = Field(min_length=1, max_length=128)
+    amount: Decimal = Field(gt=Decimal("0"), max_digits=12, decimal_places=2)
+    currency: str = Field(default="INR", min_length=3, max_length=3)
+
+    @field_validator("order_id")
+    @classmethod
+    def strip_order_id(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("order_id must not be blank")
+        return value
+
+    @field_validator("currency")
+    @classmethod
+    def normalize_currency(cls, value: str) -> str:
+        value = value.strip().upper()
+        if len(value) != 3 or not value.isalpha():
+            raise ValueError("currency must be a three-letter currency code")
+        return value
+
+
+class VerifyPaymentRequest(BaseModel):
+    """Request payload with Razorpay client callback signatures for verification."""
+    razorpay_order_id: str = Field(min_length=1, max_length=128)
+    razorpay_payment_id: str = Field(min_length=1, max_length=128)
+    razorpay_signature: str = Field(min_length=1, max_length=512)
+
+
+class PaymentOut(BaseModel):
+    """Public representation of a payment transaction record."""
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    order_id: str
+    amount: Decimal
+    currency: str
+    razorpay_order_id: str
+    razorpay_payment_id: str | None
+    status: str
+    created_at: datetime
+
+
+# ==============================================================================
+# Helper Serialization Functions
+# ==============================================================================
+
 def _payment_payload(payment: PaymentRecord) -> dict[str, Any]:
-    """Serialize a PaymentRecord into a dictionary."""
+    """Serialize a PaymentRecord model into a dictionary."""
     return {
         "id": payment.id,
         "order_id": payment.order_id,
@@ -238,8 +241,11 @@ def _payment_payload(payment: PaymentRecord) -> dict[str, Any]:
     }
 
 
-def _create_order_response(payment: PaymentRecord, razorpay_order: dict[str, Any] | None = None) -> dict[str, Any]:
-    """Construct standardized response payload for order creation."""
+def _create_order_response(
+    payment: PaymentRecord,
+    razorpay_order: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Format standard response returned after payment order creation."""
     response = {
         "payment_id": payment.id,
         "order_id": payment.order_id,
@@ -253,21 +259,18 @@ def _create_order_response(payment: PaymentRecord, razorpay_order: dict[str, Any
     return response
 
 
-# =====================================================================
-# Route Handlers
-# =====================================================================
+# ==============================================================================
+# Endpoints & Route Handlers
+# ==============================================================================
 
 @app.get("/health")
 def health() -> dict[str, Any]:
-    """Health check endpoint validating PostgreSQL database connection."""
+    """Service health and database probe endpoint."""
     try:
         with engine.connect() as connection:
             connection.execute(text("SELECT 1"))
     except SQLAlchemyError:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Database unavailable",
-        )
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Database unavailable")
     return {"status": "healthy", "database": "connected", "port": PORT}
 
 
@@ -277,11 +280,19 @@ def create_order(
     db: Session = Depends(get_db),
     _who: tuple[str, str] = Depends(require_identity),
 ) -> dict[str, Any]:
-    """Create a new payment order with Razorpay or return existing active order idempotently."""
-    existing = db.query(PaymentRecord).filter(
-        PaymentRecord.order_id == payload.order_id,
-        PaymentRecord.status.in_(["pending", "success"]),
-    ).order_by(PaymentRecord.id.desc()).first()
+    """Create a new payment order with Razorpay and persist the transaction record.
+
+    Includes idempotency protections:
+    - If a successful payment already exists for this order_id, returns HTTP 409 Conflict.
+    - If a pending payment exists with identical amount and currency, returns the existing record.
+    - If a conflicting payment amount/currency exists, returns HTTP 409 Conflict.
+    """
+    existing = (
+        db.query(PaymentRecord)
+        .filter(PaymentRecord.order_id == payload.order_id, PaymentRecord.status.in_(["pending", "success"]))
+        .order_by(PaymentRecord.id.desc())
+        .first()
+    )
 
     if existing:
         if existing.status == "success":
@@ -291,10 +302,15 @@ def create_order(
                 status_code=status.HTTP_409_CONFLICT,
                 detail="A payment already exists for this order with a different amount or currency",
             )
-        # Idempotent retry: return existing Razorpay order details without duplication
-        return JSONResponse(status_code=status.HTTP_200_OK, content=jsonable_encoder(_create_order_response(existing)))
+        # Idempotent retry: do not create another Razorpay order for the same order.
+        return JSONResponse(
+            status_code=status.HTTP_200_OK,
+            content=jsonable_encoder(_create_order_response(existing)),
+        )
 
+    # Convert amount to smallest currency subunit (paise for INR, 100 paise = 1 INR)
     amount_in_paise = int((payload.amount * Decimal("100")).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+
     try:
         razorpay_order = razorpay_client.order.create(data={
             "amount": amount_in_paise,
@@ -303,6 +319,7 @@ def create_order(
             "notes": {"order_id": payload.order_id},
         })
     except Exception as exc:
+        # Log diagnostic metadata without exposing credentials or response bodies.
         status_code = getattr(exc, "status_code", None)
         logger.error(
             "Razorpay order creation failed; exception_type=%s; upstream_status=%s",
@@ -327,20 +344,23 @@ def create_order(
         db.commit()
         db.refresh(payment)
     except IntegrityError:
-        # A concurrent request may have inserted this order after our initial read
+        # A concurrent request may have inserted this order after our initial read.
         db.rollback()
-        existing = db.query(PaymentRecord).filter(
-            PaymentRecord.order_id == payload.order_id,
-            PaymentRecord.status.in_(["pending", "success"]),
-        ).order_by(PaymentRecord.id.desc()).first()
-
+        existing = (
+            db.query(PaymentRecord)
+            .filter(PaymentRecord.order_id == payload.order_id, PaymentRecord.status.in_(["pending", "success"]))
+            .order_by(PaymentRecord.id.desc())
+            .first()
+        )
         if existing:
             if existing.status == "success":
                 raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Order has already been paid")
             if existing.amount == payload.amount and existing.currency == payload.currency:
-                return JSONResponse(status_code=status.HTTP_200_OK, content=jsonable_encoder(_create_order_response(existing)))
+                return JSONResponse(
+                    status_code=status.HTTP_200_OK,
+                    content=jsonable_encoder(_create_order_response(existing)),
+                )
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Conflicting payment already exists")
-
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Could not save payment record")
     except SQLAlchemyError:
         db.rollback()
@@ -355,14 +375,20 @@ def verify_payment(
     db: Session = Depends(get_db),
     _who: tuple[str, str] = Depends(require_identity),
 ) -> dict[str, Any]:
-    """Verify Razorpay payment HMAC-SHA256 signature and mark record as 'success'."""
+    """Cryptographically verify Razorpay HMAC-SHA256 signature and update payment status to success.
+
+    Guarantees:
+    - If payment is already in 'success' state, returns idempotently.
+    - Invalid signatures reject with HTTP 400 Bad Request without corrupting existing records.
+    - Valid signatures atomically transition status to 'success'.
+    """
     payment = db.query(PaymentRecord).filter(
         PaymentRecord.razorpay_order_id == payload.razorpay_order_id
     ).first()
     if not payment:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Payment record not found")
 
-    # Terminal state: already verified payments are permanently immutable
+    # Success is terminal here: a later malformed or replayed request cannot undo it.
     if payment.status == "success":
         return {
             "status": "success",
@@ -377,8 +403,8 @@ def verify_payment(
             "razorpay_signature": payload.razorpay_signature,
         })
     except razorpay.errors.SignatureVerificationError:
-        # Do not mark the stored payment failed: an invalid request must not alter
-        # the record or prevent the customer from retrying correctly.
+        # Do not mark stored payment failed: an invalid signature must not alter the record
+        # or prevent the customer from retrying with correct credentials.
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Payment signature verification failed",
@@ -415,7 +441,7 @@ def get_payment(
     db: Session = Depends(get_db),
     _who: tuple[str, str] = Depends(require_identity),
 ) -> dict[str, Any]:
-    """Retrieve payment attempt record by its primary ID."""
+    """Retrieve details and verification status of a payment by its database ID."""
     payment = db.query(PaymentRecord).filter(PaymentRecord.id == payment_id).first()
     if not payment:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Payment record not found")

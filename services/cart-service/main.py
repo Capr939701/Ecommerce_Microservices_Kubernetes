@@ -1,12 +1,9 @@
-"""Shopping Cart Microservice for E-Commerce Platform.
+"""Cart Microservice.
 
-Responsible for:
-  1. Managing customer shopping cart items in persistent PostgreSQL storage.
-  2. Enforcing uniqueness on (user_id, product_id) pairs to avoid duplicate cart rows.
-  3. Real-time validation of product availability and published status against Product Service.
-  4. Dynamically computing cart line subtotals and grand totals based on current catalog prices.
-  5. Checkout orchestration: forwarding cart items to Order Service and atomically
-     clearing the cart only after confirmed order creation.
+Manages user shopping carts, persistent cart line items, pricing aggregations,
+stock pre-checks against the Product Service, and atomic checkout transitions
+to the Order Service.
+Backed by PostgreSQL (with SQLite compatibility for unit tests).
 """
 
 from __future__ import annotations
@@ -24,26 +21,27 @@ from sqlalchemy import Integer, String, UniqueConstraint, create_engine, select,
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
-
-# =====================================================================
-# Configuration and Environment Variables
-# =====================================================================
+# ==============================================================================
+# Environment Configuration & Service Endpoints
+# ==============================================================================
 
 SERVICE_NAME = "cart-service"
 DATABASE_URL = os.getenv(
     "DATABASE_URL",
     "postgresql+psycopg2://cart_user:cart_pass@cart-db:5432/cart_db",
 )
-
 if not (DATABASE_URL.startswith("postgresql+") or DATABASE_URL.startswith("sqlite")):
     raise RuntimeError("DATABASE_URL must point to PostgreSQL; SQLite is not supported for application runtime")
 
+# Internal service endpoints for inter-service communication
 PRODUCT_SERVICE_URL = os.getenv("PRODUCT_SERVICE_URL", "http://product-service:8002").rstrip("/")
 ORDER_SERVICE_URL = os.getenv("ORDER_SERVICE_URL", "http://order-service:8004").rstrip("/")
 
+# Inter-service HTTP call timeouts in seconds
 PRODUCT_TIMEOUT = float(os.getenv("PRODUCT_TIMEOUT_SECONDS", "5"))
 ORDER_TIMEOUT = float(os.getenv("ORDER_TIMEOUT_SECONDS", "15"))
 
+# Database connection retry parameters
 DB_CONNECT_RETRIES = max(1, int(os.getenv("DB_CONNECT_RETRIES", "10")))
 DB_CONNECT_RETRY_DELAY_SECONDS = max(0.1, float(os.getenv("DB_CONNECT_RETRY_DELAY_SECONDS", "2")))
 
@@ -51,24 +49,22 @@ engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
 
 
-# =====================================================================
-# Database Setup and Declarative Base
-# =====================================================================
+# ==============================================================================
+# Database Models (SQLAlchemy ORM)
+# ==============================================================================
 
 class Base(DeclarativeBase):
-    """Base class for all Cart Service SQLAlchemy ORM models."""
+    """Declarative base class for Cart Service models."""
     pass
 
 
-# =====================================================================
-# SQLAlchemy Data Models
-# =====================================================================
-
 class CartItem(Base):
-    """Shopping cart record linking an authenticated user to a product and quantity."""
+    """Cart item line representing a product quantity in a specific user's shopping cart."""
 
     __tablename__ = "cart_items"
-    __table_args__ = (UniqueConstraint("user_id", "product_id", name="uq_cart_user_product"),)
+    __table_args__ = (
+        UniqueConstraint("user_id", "product_id", name="uq_cart_user_product"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
     user_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
@@ -76,35 +72,35 @@ class CartItem(Base):
     quantity: Mapped[int] = mapped_column(Integer, nullable=False)
 
 
-# =====================================================================
-# Pydantic Schemas for Request Validation
-# =====================================================================
+# ==============================================================================
+# Pydantic Schemas (Request / Response validation)
+# ==============================================================================
 
 class CartItemAdd(BaseModel):
-    """Schema for adding an item to the shopping cart."""
+    """Payload for adding an item to the user's cart."""
     product_id: str = Field(min_length=1, max_length=36)
     quantity: int = Field(default=1, gt=0, le=10000)
 
 
 class CartItemUpdate(BaseModel):
-    """Schema for updating the quantity of an existing cart item."""
+    """Payload for updating the quantity of an existing cart item."""
     quantity: int = Field(gt=0, le=10000)
 
 
 class CheckoutRequest(BaseModel):
-    """Schema for initiating order checkout from the current cart contents."""
+    """Payload for checking out the current shopping cart."""
     currency: str = Field(default="INR", min_length=3, max_length=3)
 
 
-# =====================================================================
-# HTTP Client Management and Dependencies
-# =====================================================================
+# ==============================================================================
+# HTTP Client Management & Database Initialization
+# ==============================================================================
 
 http_client: httpx.Client | None = None
 
 
 def get_http_client() -> httpx.Client:
-    """Retrieve or lazily reinitialize the shared HTTP connection pool."""
+    """Retrieve or lazily initialize the shared HTTP client for outbound service requests."""
     global http_client
     if http_client is None or http_client.is_closed:
         http_client = httpx.Client(timeout=ORDER_TIMEOUT)
@@ -112,7 +108,7 @@ def get_http_client() -> httpx.Client:
 
 
 def init_db() -> None:
-    """Initialize database tables with automatic connection retries."""
+    """Initialize database tables with connection retry logic."""
     if str(DATABASE_URL).startswith("sqlite") or str(getattr(engine, "url", "")).startswith("sqlite"):
         Base.metadata.create_all(bind=engine)
         return
@@ -135,13 +131,9 @@ def init_db() -> None:
     ) from last_error
 
 
-# =====================================================================
-# Application Lifecycle and FastAPI Setup
-# =====================================================================
-
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    """Manage application startup (DB initialization, HTTP pool) and clean shutdown."""
+    """Lifespan context manager: initializes DB and manages HTTP client session lifecycle."""
     global http_client
     init_db()
     http_client = httpx.Client(timeout=ORDER_TIMEOUT)
@@ -152,14 +144,18 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="E-Commerce Cart Service",
+    description="Shopping cart and checkout orchestrator",
     version="1.0.0",
-    description="Microservice managing persistent customer carts, live price calculation, and checkout",
     lifespan=lifespan,
 )
 
 
+# ==============================================================================
+# Dependencies & Helper Functions
+# ==============================================================================
+
 def get_db() -> Generator[Session, None, None]:
-    """Yield a database session and guarantee proper closure upon request completion."""
+    """Dependency that yields a database session and ensures proper closure."""
     db = SessionLocal()
     try:
         yield db
@@ -171,14 +167,14 @@ def identity(
     x_auth_user_id: Optional[str] = Header(None),
     x_auth_user_role: Optional[str] = Header(None),
 ) -> tuple[str, str]:
-    """Extract authenticated identity metadata forwarded from the API gateway."""
+    """Extract authenticated identity headers injected by the API gateway."""
     if not x_auth_user_id:
         raise HTTPException(status_code=401, detail="Authenticated user identity is required")
     return x_auth_user_id, (x_auth_user_role or "CUSTOMER").upper()
 
 
 def fetch_product(product_id: str, user_id: str, role: str) -> dict:
-    """Query Product Service via internal network to verify stock, price, and publication state."""
+    """Fetch live product details and inventory availability from the Product Service."""
     client = get_http_client()
     try:
         response = client.get(
@@ -200,19 +196,19 @@ def fetch_product(product_id: str, user_id: str, role: str) -> dict:
 
 
 def find_item(db: Session, user_id: str, product_id: str) -> Optional[CartItem]:
-    """Lookup an existing cart item for a given user and product."""
+    """Look up an existing cart item for a given user and product ID."""
     return db.scalar(
         select(CartItem).where(CartItem.user_id == user_id, CartItem.product_id == product_id)
     )
 
 
-# =====================================================================
-# Route Handlers
-# =====================================================================
+# ==============================================================================
+# Endpoints & Route Handlers
+# ==============================================================================
 
 @app.get("/health")
 def health(db: Session = Depends(get_db)) -> dict:
-    """Health check endpoint validating service and PostgreSQL database readiness."""
+    """Service health and database probe endpoint."""
     try:
         db.execute(text("SELECT 1"))
         return {"status": "UP", "service": SERVICE_NAME, "database": "UP"}
@@ -229,16 +225,19 @@ def add_to_cart(
     db: Session = Depends(get_db),
     who: tuple[str, str] = Depends(identity),
 ) -> dict:
-    """Add a product to the user's cart or increment its quantity if already present."""
+    """Add a product quantity to the user's shopping cart after validating stock."""
     user_id, role = who
-    product = fetch_product(item.product_id, user_id, role)
 
+    # Verify that the product is active and published
+    product = fetch_product(item.product_id, user_id, role)
     if product.get("status") != "PUBLISHED":
         raise HTTPException(status_code=409, detail="Product is not available for purchase")
 
+    # Calculate cumulative quantity if product already exists in cart
     existing = find_item(db, user_id, item.product_id)
     new_quantity = item.quantity + (existing.quantity if existing else 0)
 
+    # Validate stock limits
     if int(product.get("stock", 0)) < new_quantity:
         raise HTTPException(
             status_code=409,
@@ -271,9 +270,10 @@ def view_cart(
     db: Session = Depends(get_db),
     who: tuple[str, str] = Depends(identity),
 ) -> dict:
-    """Retrieve all items in the user's cart with live catalog prices and computed subtotals."""
+    """View the calling user's cart with live prices, product names, and subtotal."""
     user_id, role = who
     rows = db.scalars(select(CartItem).where(CartItem.user_id == user_id).order_by(CartItem.id)).all()
+
     items = []
     total = Decimal("0.00")
 
@@ -320,12 +320,13 @@ def update_item(
     db: Session = Depends(get_db),
     who: tuple[str, str] = Depends(identity),
 ) -> dict:
-    """Set the exact quantity of an existing item in the cart."""
+    """Update the quantity of a specific product line in the user's cart."""
     user_id, role = who
     row = find_item(db, user_id, product_id)
     if not row:
         raise HTTPException(status_code=404, detail="Item not in cart")
 
+    # Verify inventory availability for updated quantity
     product = fetch_product(product_id, user_id, role)
     if int(product.get("stock", 0)) < updated.quantity:
         raise HTTPException(
@@ -349,7 +350,7 @@ def remove_item(
     db: Session = Depends(get_db),
     who: tuple[str, str] = Depends(identity),
 ) -> dict:
-    """Remove a single product from the user's shopping cart."""
+    """Delete a single product line item from the user's cart."""
     user_id, _role = who
     row = find_item(db, user_id, product_id)
     if not row:
@@ -366,7 +367,7 @@ def clear_cart(
     db: Session = Depends(get_db),
     who: tuple[str, str] = Depends(identity),
 ) -> dict:
-    """Clear all items from the authenticated user's shopping cart."""
+    """Remove all items from the current user's shopping cart."""
     user_id, _role = who
     db.query(CartItem).filter(CartItem.user_id == user_id).delete(synchronize_session=False)
     db.commit()
@@ -380,13 +381,10 @@ def checkout(
     db: Session = Depends(get_db),
     who: tuple[str, str] = Depends(identity),
 ) -> dict:
-    """Submit the cart contents to Order Service and clear the cart upon success.
-    
-    Ensures that the cart is only emptied after Order Service durably confirms
-    order creation and inventory reservation.
-    """
+    """Submit the contents of the cart to create an Order and clear the cart upon success."""
     user_id, role = who
     rows = db.scalars(select(CartItem).where(CartItem.user_id == user_id).order_by(CartItem.id)).all()
+
     if not rows:
         raise HTTPException(status_code=400, detail="Cart is empty")
 
@@ -423,7 +421,7 @@ def checkout(
 
     order = response.json()
 
-    # Only clear cart after the Order Service confirms that an order was durably created
+    # Clear cart only after Order Service confirms durable order creation
     db.query(CartItem).filter(CartItem.user_id == user_id).delete(synchronize_session=False)
     db.commit()
 
